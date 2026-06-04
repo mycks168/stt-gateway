@@ -1,0 +1,14 @@
+[Unit]
+Description=STT Gateway (faster-whisper)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/stt-gateway
+EnvironmentFile=-/opt/stt-gateway/.env
+ExecStart=/bin/bash scripts/run_server.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
