@@ -15,6 +15,28 @@ pip install -e .
 cp .env.example .env
 ```
 
+## 必要環境（GPU利用時）
+`faster-whisper` が内部で使う CTranslate2 は、実行時に **CUDA 12 の `libcublas.so.12`**
+を dlopen する。`nvidia-smi` が `CUDA Version: 13.x` と表示していても、CUDA 12 の cuBLAS
+が入っていなければ利用できない点に注意。
+
+不足している場合、**モデルの読み込みは成功するが最初の推論で失敗**し、
+`CUBLAS_STATUS_NOT_SUPPORTED` となって `/transcribe` が 500 を返す。
+
+確認:
+```bash
+ldconfig -p | grep -i cublas   # libcublas.so.12 が出るか
+```
+
+対策は依存関係に含めた `nvidia-cublas-cu12` で完結する。`scripts/run_server.sh` が
+このパッケージのライブラリパスを自動的に `LD_LIBRARY_PATH` へ追加するため、
+通常は追加作業は不要（システムに CUDA 12 が入っている環境でも実害はない）。
+
+サーバを手動で起動する場合は、同じパスを明示的に通すこと:
+```bash
+export LD_LIBRARY_PATH="$(python -c 'import nvidia.cublas.lib as m; print(list(m.__path__)[0])'):$LD_LIBRARY_PATH"
+```
+
 ## 設定（.env）
 ```env
 STT_HOST=0.0.0.0

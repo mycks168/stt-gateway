@@ -13,6 +13,10 @@ dependencies = [
   "python-multipart>=0.0.9",
   "python-dotenv>=1.0.1",
   "faster-whisper>=1.0.3",
+  # CTranslate2 は実行時に libcublas.so.12 (CUDA 12) を dlopen する。
+  # CUDA 13 のみのホストではシステムに .so.12 が無く、推論時に
+  # CUBLAS_STATUS_NOT_SUPPORTED で失敗するため同梱する。
+  "nvidia-cublas-cu12>=12.4; sys_platform == 'linux'",
 ]
 
 [tool.setuptools]
