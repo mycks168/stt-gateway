@@ -9,6 +9,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from faster_whisper import WhisperModel
 
 from .config import settings
+from .formats import UnsupportedAudioFormat, resolve_suffix
 
 app = FastAPI(title="stt-gateway", version="0.1.0")
 _model: WhisperModel | None = None
@@ -50,7 +51,11 @@ async def transcribe(
     language: str | None = Form(default=None),
     _: None = Depends(verify_token),
 ) -> dict:
-    suffix = Path(file.filename or "audio.wav").suffix or ".wav"
+    try:
+        suffix = resolve_suffix(file.filename)
+    except UnsupportedAudioFormat as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
         tmp = tf.name
         tf.write(await file.read())
