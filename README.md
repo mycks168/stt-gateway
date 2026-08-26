@@ -1,83 +1,91 @@
 # stt-gateway
 
-faster-whisper ベースの STT API サーバ。
+faster-whisper ベースの STT API サーバ。音声ファイルを受け取り、文字起こし結果を JSON で返す。
 
-## ポート
-- デフォルト: **23000**
+## 動作要件
+- Python 3.10 以上
+- [uv](https://docs.astral.sh/uv/)
+- GPU を使う場合: NVIDIA ドライバ
+
+CTranslate2 は実行時に CUDA 12 の `libcublas.so.12` を必要とする。これは依存パッケージ
+`nvidia-cublas-cu12` に含まれており、`scripts/run_server.sh` が自動的に
+`LD_LIBRARY_PATH` へ追加する。
 
 ## セットアップ
 ```bash
-cd stt-gateway
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -e .
+uv sync
 cp .env.example .env
 ```
 
-## 必要環境（GPU利用時）
-`faster-whisper` が内部で使う CTranslate2 は、実行時に **CUDA 12 の `libcublas.so.12`**
-を dlopen する。`nvidia-smi` が `CUDA Version: 13.x` と表示していても、CUDA 12 の cuBLAS
-が入っていなければ利用できない点に注意。
-
-不足している場合、**モデルの読み込みは成功するが最初の推論で失敗**し、
-`CUBLAS_STATUS_NOT_SUPPORTED` となって `/transcribe` が 500 を返す。
-
-確認:
-```bash
-ldconfig -p | grep -i cublas   # libcublas.so.12 が出るか
-```
-
-対策は依存関係に含めた `nvidia-cublas-cu12` で完結する。`scripts/run_server.sh` が
-このパッケージのライブラリパスを自動的に `LD_LIBRARY_PATH` へ追加するため、
-通常は追加作業は不要（システムに CUDA 12 が入っている環境でも実害はない）。
-
-サーバを手動で起動する場合は、同じパスを明示的に通すこと:
-```bash
-export LD_LIBRARY_PATH="$(python -c 'import nvidia.cublas.lib as m; print(list(m.__path__)[0])'):$LD_LIBRARY_PATH"
-```
-
 ## 設定（.env）
-```env
-STT_HOST=0.0.0.0
-STT_PORT=23000
-STT_MODEL=large-v3-turbo
-STT_DEVICE=auto
-STT_COMPUTE_TYPE=int8_float16
-STT_LANGUAGE=ja
-STT_API_KEY=         # Bearer認証トークン（空にすると認証スキップ）
-```
+
+| 変数 | デフォルト | 説明 |
+|---|---|---|
+| `STT_HOST` | `0.0.0.0` | バインドするアドレス |
+| `STT_PORT` | `23000` | ポート |
+| `STT_MODEL` | `large-v3-turbo` | faster-whisper のモデル名 |
+| `STT_DEVICE` | `auto` | `auto` / `cuda` / `cpu` |
+| `STT_COMPUTE_TYPE` | `int8_float16` | `int8` / `int8_float16` / `float16` / `float32` |
+| `STT_LANGUAGE` | `ja` | `language` 未指定時に使う言語 |
+| `STT_API_KEY` | (空) | Bearer トークン。空の場合はトークンの値を検証しない |
+
+モデルは初回起動時に Hugging Face Hub からダウンロードされ、`~/.cache/huggingface` に
+キャッシュされる。`large-v3-turbo` は約 1.6GB。
 
 ## 起動
 ```bash
 bash scripts/run_server.sh
 ```
-`uv sync` を使う環境でも動くように、`uvicorn` が見つからない場合は `uv run uvicorn` を自動利用します。
 
-## ヘルスチェック
+systemd で常駐させる場合:
+```bash
+sudo cp stt-gateway.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now stt-gateway
+sudo journalctl -u stt-gateway -f
+```
+`stt-gateway.service` は配置先を `/opt/stt-gateway` として定義している。別の場所に置く
+場合は `WorkingDirectory` と `EnvironmentFile` を書き換える。
+
+## API
+
+### GET /health
+認証不要。
+
 ```bash
 curl http://127.0.0.1:23000/health
 ```
+```json
+{
+  "ok": true,
+  "model": "large-v3-turbo",
+  "device": "auto",
+  "compute_type": "int8_float16"
+}
+```
 
-## 推論API
-`POST /transcribe` (multipart)
+### POST /transcribe
+`multipart/form-data`。`Authorization: Bearer <token>` ヘッダが必須で、ヘッダが無い場合は
+`401` を返す。`STT_API_KEY` が空のときはトークンの値を検証しない。
 
-`STT_API_KEY` を設定した場合は `Authorization: Bearer <token>` ヘッダが必須。
+| パラメータ | 必須 | 説明 |
+|---|---|---|
+| `file` | ○ | 音声ファイル |
+| `language` | | 言語コード。省略時は `STT_LANGUAGE` |
 
-### 対応フォーマット
-アップロードするファイルの拡張子で判定する。それ以外の拡張子は `400` エラーになる。
+#### 対応フォーマット
+ファイルの拡張子で判定する。ファイル名または拡張子が無い場合は `.wav` として扱う。
 
-| 拡張子 | 用途 |
+| 拡張子 | 内容 |
 |---|---|
-| `.wav` | 既存クライアント向け（無圧縮） |
-| `.ogg` / `.opus` | Opus（Oggコンテナ）。LTEなど帯域が限られる環境向け |
-| `.webm` | Opus（WebMコンテナ、ブラウザ録音等） |
+| `.wav` | WAV（無圧縮） |
+| `.ogg` / `.opus` | Opus（Ogg コンテナ） |
+| `.webm` | Opus（WebM コンテナ） |
 
-デコード自体は `faster-whisper` が内部のffmpeg(PyAV)で行うため、上記以外の
-コンテナ/コーデックが必要になった場合は `src/stt_gateway/formats.py` の
-許可リストに追加するだけでよい。
+許可リストは `src/stt_gateway/formats.py` の `ALLOWED_SUFFIXES` で定義する。
+デコードは faster-whisper が内部の PyAV(ffmpeg) で行う。
 
-例（WAV、従来通り）:
+#### リクエスト例
 ```bash
 curl -X POST http://127.0.0.1:23000/transcribe \
   -H "Authorization: Bearer YOUR_TOKEN" \
@@ -85,7 +93,6 @@ curl -X POST http://127.0.0.1:23000/transcribe \
   -F "language=ja"
 ```
 
-例（Opus圧縮、LTE向け）:
 ```bash
 curl -X POST http://127.0.0.1:23000/transcribe \
   -H "Authorization: Bearer YOUR_TOKEN" \
@@ -93,7 +100,7 @@ curl -X POST http://127.0.0.1:23000/transcribe \
   -F "language=ja"
 ```
 
-レスポンス例:
+#### レスポンス
 ```json
 {
   "ok": true,
@@ -105,10 +112,20 @@ curl -X POST http://127.0.0.1:23000/transcribe \
 }
 ```
 
+| ステータス | 条件 | `detail` |
+|---|---|---|
+| `400` | 対応外の拡張子 | `unsupported audio format: '.mp4' (allowed: .ogg, .opus, .wav, .webm)` |
+| `401` | ヘッダが無い | `Not authenticated` |
+| `401` | トークンが一致しない | `invalid_token` |
+| `500` | 文字起こしに失敗 | `transcribe_failed: <理由>` |
+
 ## テスト
 ```bash
 uv sync --group dev
 uv run pytest --cov=stt_gateway
 ```
-モデル本体は読み込まず（ダミーモデルに差し替え済み）、フォーマット判定とAPIの
-振る舞いのみを検証する。
+モデルはダミーに差し替えて実行するため、GPU とモデル本体は不要。フォーマット判定と
+API の振る舞いを検証する。
+
+カバレッジは 80% を下回るとテストが失敗する（`pyproject.toml` の
+`[tool.coverage.report] fail_under`）。
