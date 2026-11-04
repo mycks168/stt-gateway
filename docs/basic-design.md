@@ -9,6 +9,7 @@
               backends.py（設定でバックエンドを選ぶ）
                  ├─ whisper_backend.py … faster-whisper
                  └─ haas_backend.py    … Haas-ja（haas-asr / NeMo）
+                        └─ audio_decoding.py … PyAV でデコード
 ```
 
 | モジュール | 責務 |
@@ -20,6 +21,7 @@
 | `backends.py` | 設定に応じたバックエンドの読み込みと、`/health` 用の情報の算出 |
 | `whisper_backend.py` | faster-whisper による文字起こし |
 | `haas_backend.py` | Haas-ja による文字起こし |
+| `audio_decoding.py` | PyAV(ffmpeg) による音声ファイルから波形へのデコード（haas が使う） |
 
 依存の向きは `server → backends → 各バックエンド → transcription` の一方向とする。
 `server.py` は faster-whisper や NeMo を直接 import しない。
@@ -113,9 +115,13 @@ VAD（発話区間検出）を有効にし、しきい値は 0.3 とする（既
 ### 3.2 haas バックエンド
 
 1. 言語が `ja` 以外なら、デコードの前に `400` で拒否する。Haas-ja は日本語専用のため。
-2. faster-whisper の `decode_audio`（PyAV）で 16kHz モノラルの波形にする。
-   haas-asr 付属の `load_audio` は libsndfile を使い WebM を読めないため、
-   whisper バックエンドと対応フォーマットをそろえる目的でこちらを使う。
+2. `audio_decoding.py` で、PyAV を使って 16kHz モノラル float32 の波形にする。
+   - haas-asr 付属の `load_audio` は libsndfile を使い WebM を読めない。whisper バックエンドと
+     対応フォーマットをそろえるため PyAV を使う。
+   - faster-whisper の `decode_audio` は使わない。同じ処理だが最後に `gc.collect()` を呼び、
+     NeMo と torch を読み込んだプロセスではそれだけで 1 回 200ms 以上かかるため。
+   - ステレオは ffmpeg の標準の方法でモノラルにまとめる（faster-whisper と同じ結果になる）。
+   - デコードに失敗した場合は `500`（`transcribe_failed: failed to decode audio: <パス>: <理由>`）。
 3. `haas_asr.transcribe_longform` で文字起こしする。Haas-ja は 30 秒以下の発話で学習されており、
    長い音声は無音位置で分割して推論する必要があるため。30 秒以下の音声はそのまま 1 チャンクになる。
 
@@ -126,7 +132,7 @@ Haas-ja の出力は「、」はある程度付くが「。」はほとんど付
 
 | 区分 | 内容 |
 |---|---|
-| 必須 | fastapi、uvicorn、pydantic、python-multipart、python-dotenv、faster-whisper、numpy、nvidia-cublas-cu12（Linux） |
+| 必須 | fastapi、uvicorn、pydantic、python-multipart、python-dotenv、faster-whisper、av、numpy、nvidia-cublas-cu12（Linux） |
 | extras `haas` | haas-asr（GitHub のコミット固定）、torch 2.14.0。Python 3.11 以上かつ Linux のみ |
 
 - **nvidia-cublas-cu12**：CTranslate2 は実行時に CUDA 12 の `libcublas.so.12` を読み込む。

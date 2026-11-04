@@ -9,12 +9,9 @@ import importlib
 from collections.abc import Callable
 from pathlib import Path
 
-import numpy as np
-import numpy.typing as npt
-
+from .audio_decoding import AudioSamples, decode_to_mono
 from .transcription import Transcription, UnsupportedLanguageError
 
-AudioSamples = npt.NDArray[np.float32]
 Recognizer = Callable[[AudioSamples], str]
 AudioDecoder = Callable[[Path], AudioSamples]
 
@@ -47,16 +44,13 @@ class HaasTranscriber:
         )
 
 
-def decode_with_pyav(audio_path: Path) -> AudioSamples:
-    """PyAV(ffmpeg) で 16kHz モノラルにデコードする。
+def decode_for_haas(audio_path: Path) -> AudioSamples:
+    """Haas-ja の入力形式（16kHz モノラル）にデコードする。
 
     haas-asr 付属の load_audio は libsndfile を使うため WebM を読めない。
-    Whisper バックエンドと同じ対応フォーマットにそろえるため、faster-whisper のデコーダを使う。
+    Whisper バックエンドと対応フォーマットをそろえるため、PyAV でデコードする。
     """
-    from faster_whisper import decode_audio
-
-    samples: AudioSamples = decode_audio(str(audio_path), sampling_rate=SAMPLE_RATE_HZ)
-    return samples
+    return decode_to_mono(audio_path, SAMPLE_RATE_HZ)
 
 
 def load_haas_transcriber(model_name: str) -> HaasTranscriber:
@@ -75,4 +69,4 @@ def load_haas_transcriber(model_name: str) -> HaasTranscriber:
         text: str = haas_asr.transcribe_longform(model, samples, batch_size=LONGFORM_BATCH_SIZE)
         return text
 
-    return HaasTranscriber(recognize, decode_with_pyav)
+    return HaasTranscriber(recognize, decode_for_haas)

@@ -10,7 +10,8 @@ import numpy as np
 import pytest
 
 from stt_gateway import haas_backend
-from stt_gateway.haas_backend import SAMPLE_RATE_HZ, AudioSamples, HaasTranscriber
+from stt_gateway.audio_decoding import AudioSamples
+from stt_gateway.haas_backend import SAMPLE_RATE_HZ, HaasTranscriber
 from stt_gateway.transcription import UnsupportedLanguageError
 
 _TWO_SECONDS = np.zeros(SAMPLE_RATE_HZ * 2, dtype=np.float32)
@@ -52,19 +53,17 @@ def test_haas_transcriber_rejects_non_japanese_before_decoding() -> None:
     assert not decoded
 
 
-def test_decode_with_pyav_requests_model_sample_rate(monkeypatch: pytest.MonkeyPatch) -> None:
-    import faster_whisper
+def test_decode_for_haas_uses_model_sample_rate(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[Path, int]] = []
 
-    calls: list[tuple[str, int]] = []
-
-    def fake_decode_audio(path: str, sampling_rate: int) -> AudioSamples:
+    def fake_decode_to_mono(audio_path: Path, sample_rate_hz: int) -> AudioSamples:
         """引数を記録する。"""
-        calls.append((path, sampling_rate))
+        calls.append((audio_path, sample_rate_hz))
         return _TWO_SECONDS
 
-    monkeypatch.setattr(faster_whisper, "decode_audio", fake_decode_audio)
-    assert haas_backend.decode_with_pyav(Path("/tmp/a.webm")) is _TWO_SECONDS
-    assert calls == [("/tmp/a.webm", SAMPLE_RATE_HZ)]
+    monkeypatch.setattr(haas_backend, "decode_to_mono", fake_decode_to_mono)
+    assert haas_backend.decode_for_haas(Path("/tmp/a.webm")) is _TWO_SECONDS
+    assert calls == [(Path("/tmp/a.webm"), SAMPLE_RATE_HZ)]
 
 
 def test_load_haas_transcriber_uses_longform_recognition(
@@ -83,7 +82,7 @@ def test_load_haas_transcriber_uses_longform_recognition(
         transcribe_longform=transcribe_longform,
     )
     monkeypatch.setitem(sys.modules, "haas_asr", fake_haas_asr)
-    monkeypatch.setattr(haas_backend, "decode_with_pyav", _decode_two_seconds)
+    monkeypatch.setattr(haas_backend, "decode_for_haas", _decode_two_seconds)
 
     transcriber = haas_backend.load_haas_transcriber("third-intelligence/Haas-ja-v1.0")
 

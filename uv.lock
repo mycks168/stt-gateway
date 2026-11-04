@@ -5457,6 +5457,7 @@ name = "stt-gateway"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
+    { name = "av" },
     { name = "fastapi" },
     { name = "faster-whisper" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -5483,6 +5484,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "av", specifier = ">=11" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "faster-whisper", specifier = ">=1.0.3" },
     { name = "haas-asr", marker = "python_full_version >= '3.11' and sys_platform == 'linux' and extra == 'haas'", git = "https://github.com/third-intelligence/Haas-ASR.git?rev=acc614f68769dcbfae9dba96b48439c4a66295af" },
