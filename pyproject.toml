@@ -4,11 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stt-gateway"
-version = "0.1.0"
-description = "FastAPI STT gateway powered by faster-whisper"
+version = "0.2.0"
+description = "FastAPI STT gateway powered by faster-whisper or Haas-ja"
 requires-python = ">=3.10"
 dependencies = [
   "fastapi>=0.115.0",
+  "pydantic>=2.0",
   "uvicorn>=0.30.0",
   "python-multipart>=0.0.9",
   "python-dotenv>=1.0.1",
@@ -17,6 +18,17 @@ dependencies = [
   # CUDA 13 のみのホストではシステムに .so.12 が無く、推論時に
   # CUBLAS_STATUS_NOT_SUPPORTED で失敗するため同梱する。
   "nvidia-cublas-cu12>=12.4; sys_platform == 'linux'",
+  # WhisperTranscriber 以外でも波形を型付きで扱うため直接依存にする（faster-whisper 経由でも入る）。
+  "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# STT_BACKEND=haas のときだけ必要。NeMo と torch を含み venv が数GB 増えるため extras に分ける。
+# haas-asr は PyPI に無く、NeMo の非公開 API に依存するので動作確認したコミットに固定する。
+haas = [
+  # 精度と速度を検証した版。haas-asr 側には上限が無く、新しい torch が選ばれてしまうため固定する。
+  "torch==2.14.0 ; python_version >= '3.11' and sys_platform == 'linux'",
+  "haas-asr @ git+https://github.com/third-intelligence/Haas-ASR.git@acc614f68769dcbfae9dba96b48439c4a66295af ; python_version >= '3.11' and sys_platform == 'linux'",
 ]
 
 [tool.setuptools]
@@ -30,6 +42,20 @@ dev = [
   "pytest>=8.0.0",
   "httpx>=0.27.0",
   "pytest-cov>=7.1.0",
+]
+
+[tool.uv]
+# NeMo 2.7.3 の CUDA グラフ用デコーダは、実行時にコンパイルされると共有の b" " オブジェクトを
+# 書き換え、その後にコンパイルされたモジュールの定数が壊れる。インストール時に全モジュールを
+# バイトコード化しておけば実行時のコンパイルが起きない（haas-asr の推奨設定と同じ）。
+compile-bytecode = true
+# haas-asr 自身の uv.lock と同じ上書き。NeMo 2.7.3 のメタデータの下限より新しい、
+# セキュリティ修正済みの版を使う。lightning は NeMo の 2.4.0 のまま（新しい版ではモデル読み込みが失敗する）。
+override-dependencies = [
+  "fsspec[http]>=2026.6.0",
+  "hydra-core>=1.3.8",
+  "packaging>=26.3",
+  "transformers>=5.10.0",
 ]
 
 [tool.pytest.ini_options]

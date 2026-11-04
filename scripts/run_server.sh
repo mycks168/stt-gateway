@@ -24,11 +24,17 @@ setup_cublas_path() {
   fi
 }
 
+# Haas-ja の依存（NeMo, torch）は extras に分けている。uv 管理の環境では起動時に入れる。
+UV_RUN=(uv run)
+if [ "${STT_BACKEND:-whisper}" = "haas" ]; then
+  UV_RUN=(uv run --extra haas)
+fi
+
 if command -v uvicorn >/dev/null 2>&1; then
   setup_cublas_path python
   PYTHONPATH=src uvicorn stt_gateway.server:app --host "$HOST" --port "$PORT"
 else
   # uv-managed environment fallback
-  setup_cublas_path uv run python
-  PYTHONPATH=src uv run uvicorn stt_gateway.server:app --host "$HOST" --port "$PORT"
+  setup_cublas_path "${UV_RUN[@]}" python
+  PYTHONPATH=src "${UV_RUN[@]}" uvicorn stt_gateway.server:app --host "$HOST" --port "$PORT"
 fi

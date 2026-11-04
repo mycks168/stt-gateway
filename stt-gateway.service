@@ -1,5 +1,5 @@
 [Unit]
-Description=STT Gateway (faster-whisper)
+Description=STT Gateway (faster-whisper / Haas-ja)
 After=network.target
 
 [Service]
