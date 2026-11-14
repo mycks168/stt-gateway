@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stt-gateway"
-version = "0.2.0"
+version = "0.3.0"
 description = "FastAPI STT gateway powered by faster-whisper or Haas-ja"
 requires-python = ">=3.10"
 dependencies = [

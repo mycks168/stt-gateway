@@ -7,7 +7,8 @@ Type=simple
 WorkingDirectory=/opt/stt-gateway
 EnvironmentFile=-/opt/stt-gateway/.env
 ExecStart=/bin/bash scripts/run_server.sh
-Restart=on-failure
+# STT_MAX_REQUESTS でワーカー 1 つのプロセスが正常終了したときも起動し直すため always にする。
+Restart=always
 RestartSec=5
 
 [Install]

@@ -33,11 +33,22 @@ uv sync --extra haas
 | `STT_HAAS_MODEL` | `third-intelligence/Haas-ja-v1.0` | Haas-ja のモデル（haas のみ） |
 | `STT_LANGUAGE` | `ja` | `language` 未指定時に使う言語 |
 | `STT_API_KEY` | (空) | Bearer トークン。空の場合はトークンの値を検証しない |
+| `STT_WORKERS` | `1` | 同時に文字起こしできる件数（ワーカープロセス数） |
+| `STT_MAX_REQUESTS` | `0` | 1 ワーカーがこの件数を処理したら、ワーカーを起動し直す。`0` で無効 |
+| `STT_MAX_REQUESTS_JITTER` | `0` | 起動し直すまでの件数を、ワーカーごとに 0〜この値だけずらす |
 
 - `STT_BACKEND` に上記以外の値を書くと、サーバは起動しない。
-- モデルは最初の文字起こしのときに Hugging Face Hub からダウンロードされ、
+- モデルはサーバの起動時に読み込む。初回は Hugging Face Hub からダウンロードされ、
   `~/.cache/huggingface` にキャッシュされる。`large-v3-turbo` は約 1.6GB。
-  そのため最初のリクエストだけ時間がかかる。
+  読み込みが終わるまで `/transcribe` は応答を待たせる。
+- ワーカーごとにモデルを読み込むため、GPU メモリも `STT_WORKERS` の数だけ必要になる
+  （haas は 1 ワーカーあたり最大約 3.6GB）。
+- 同時に来たリクエストが `STT_WORKERS` を超えると、空いたワーカーから順に処理する。
+  待っている間もエラーにはならない。
+- `STT_MAX_REQUESTS` の件数には `/health` も含まれる。起動し直しているワーカーは、
+  モデルを読み込み終えるまでリクエストを処理しない。
+- `STT_WORKERS=1` で `STT_MAX_REQUESTS` を使う場合は、systemd で常駐させる。
+  `scripts/run_server.sh` を直接実行していると、指定件数でサーバが終了したままになる。
 - `haas` では日本語（`ja`）しか文字起こしできない。
 
 ## 起動
@@ -111,6 +122,8 @@ curl -X POST http://127.0.0.1:23000/transcribe \
   "model": "large-v3-turbo"
 }
 ```
+
+`latency_ms` は、ほかのリクエストの処理を待った時間を含む。
 
 | ステータス | 条件 | `detail` |
 |---|---|---|

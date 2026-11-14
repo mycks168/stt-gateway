@@ -2,22 +2,52 @@
 
 from __future__ import annotations
 
+import logging
 import tempfile
 import time
-from functools import lru_cache
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Security, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Security, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
 from .backends import describe_backend, load_transcriber
 from .config import settings
 from .formats import UnsupportedAudioFormat, resolve_suffix
+from .serial_transcriber import SerialTranscriber
 from .transcription import BackendName, Transcriber, UnsupportedLanguageError
 
-app = FastAPI(title="stt-gateway", version="0.2.0")
+logger = logging.getLogger(__name__)
+
+
+def load_configured_transcriber() -> Transcriber:
+    """現在の設定のバックエンドを読み込む。"""
+    return load_transcriber(settings)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """ワーカーの起動時にモデルを読み込む。
+
+    読み込みに失敗しても起動は続ける。失敗の理由を /transcribe の 500 で利用者に返せるよう、
+    最初のリクエストで読み込みを再試行する。
+    """
+    serial_transcriber = SerialTranscriber(load_configured_transcriber)
+    app.state.serial_transcriber = serial_transcriber
+    try:
+        await serial_transcriber.preload()
+    except Exception:
+        logger.exception(
+            "failed to preload transcriber (backend=%s); retrying on first request",
+            settings.backend,
+        )
+    yield
+
+
+app = FastAPI(title="stt-gateway", version="0.3.0", lifespan=lifespan)
 _bearer = HTTPBearer()
 
 
@@ -53,10 +83,12 @@ def verify_token(
         raise HTTPException(status_code=401, detail="invalid_token")
 
 
-@lru_cache(maxsize=1)
-def get_transcriber() -> Transcriber:
-    """最初のリクエストでモデルを読み込み、以降は使い回す。"""
-    return load_transcriber(settings)
+def get_serial_transcriber(request: Request) -> SerialTranscriber:
+    """lifespan で用意した、このワーカーの文字起こし窓口を返す。"""
+    serial_transcriber = getattr(request.app.state, "serial_transcriber", None)
+    if not isinstance(serial_transcriber, SerialTranscriber):
+        raise RuntimeError("serial_transcriber is not initialized: app started without lifespan")
+    return serial_transcriber
 
 
 @app.get("/health")
@@ -76,9 +108,14 @@ def health() -> HealthResponse:
 async def transcribe(
     file: Annotated[UploadFile, File()],
     _: Annotated[None, Depends(verify_token)],
+    serial_transcriber: Annotated[SerialTranscriber, Depends(get_serial_transcriber)],
     language: Annotated[str | None, Form()] = None,
 ) -> TranscribeResponse:
-    """アップロードされた音声を一時ファイルに書き出して文字起こしする。"""
+    """アップロードされた音声を一時ファイルに書き出して文字起こしする。
+
+    同じワーカーで処理中の文字起こしがあれば、それが終わるまで待つ。
+    latency_ms はその待ち時間を含む。
+    """
     try:
         suffix = resolve_suffix(file.filename)
     except UnsupportedAudioFormat as error:
@@ -90,8 +127,7 @@ async def transcribe(
 
     start = time.perf_counter()
     try:
-        # モデルの読み込み失敗（extras 未導入など）も 500 の理由として返すため try の中で取得する
-        result = get_transcriber().transcribe(audio_path, language or settings.language)
+        result = await serial_transcriber.transcribe(audio_path, language or settings.language)
     except UnsupportedLanguageError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     except Exception as error:

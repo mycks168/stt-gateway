@@ -3,7 +3,11 @@
 ## 1. 全体構成
 
 ```
+uvicorn（STT_WORKERS 個のワーカープロセス）
+  └─ ワーカーごとに:
 クライアント ──HTTP──▶ server.py（API・認証）
+                          ▼
+              serial_transcriber.py（推論を 1 件ずつ実行）
                           │ Transcriber（Protocol）
                           ▼
               backends.py（設定でバックエンドを選ぶ）
@@ -14,7 +18,8 @@
 
 | モジュール | 責務 |
 |---|---|
-| `server.py` | HTTP API、Bearer 認証、一時ファイルの管理、例外から HTTP ステータスへの変換 |
+| `server.py` | HTTP API、Bearer 認証、一時ファイルの管理、例外から HTTP ステータスへの変換、起動時のモデル読み込み |
+| `serial_transcriber.py` | ワーカー内でのモデルの保持と、推論を 1 件ずつ別スレッドで実行する順番待ち |
 | `config.py` | 環境変数（`.env` を含む）の読み込みと検証 |
 | `formats.py` | 拡張子による音声フォーマットの判定 |
 | `transcription.py` | バックエンドの共通インタフェース（`Transcriber`）、結果の型（`Transcription`）、例外 |
@@ -23,7 +28,7 @@
 | `haas_backend.py` | Haas-ja による文字起こし |
 | `audio_decoding.py` | PyAV(ffmpeg) による音声ファイルから波形へのデコード（haas が使う） |
 
-依存の向きは `server → backends → 各バックエンド → transcription` の一方向とする。
+依存の向きは `server → serial_transcriber / backends → 各バックエンド → transcription` の一方向とする。
 `server.py` は faster-whisper や NeMo を直接 import しない。
 
 ## 2. 外部仕様
@@ -41,6 +46,12 @@
 | `STT_HAAS_MODEL` | `third-intelligence/Haas-ja-v1.0` | haas | Hugging Face のモデル ID または `.nemo` ファイルのパス |
 | `STT_LANGUAGE` | `ja` | 共通 | リクエストで `language` を省略したときの言語 |
 | `STT_API_KEY` | (空) | 共通 | Bearer トークン。空のときはトークンの値を検証しない |
+| `STT_WORKERS` | `1` | 共通 | uvicorn のワーカープロセス数（`scripts/run_server.sh` が使う）。1 以上の整数 |
+| `STT_MAX_REQUESTS` | `0` | 共通 | 1 ワーカーがこの件数のリクエストを処理したら終了させる。`0` で無効（同上） |
+| `STT_MAX_REQUESTS_JITTER` | `0` | 共通 | 終了までの件数にワーカーごとに加える乱数の上限（同上） |
+
+`STT_WORKERS` / `STT_MAX_REQUESTS` / `STT_MAX_REQUESTS_JITTER` が 0 以上の整数でない場合、
+または `STT_WORKERS` が 0 の場合は、`scripts/run_server.sh` がエラーを出して起動しない。
 
 Haas-ja は常に GPU（`cuda`）・bfloat16 で動かす。haas-asr が使う flash-linear-attention が
 Triton と CUDA を必要とし、公表されている精度と速度も bfloat16 で測られているため。
@@ -83,7 +94,7 @@ Triton と CUDA を必要とし、公表されている精度と速度も bfloat
 | `text` | string | 文字起こし結果（前後の空白は除く） |
 | `language` | string | whisper は Whisper が判定した言語、haas は指定された言語（`ja`） |
 | `duration` | number \| null | 音声の長さ（秒） |
-| `latency_ms` | int | 文字起こしにかかった時間（ミリ秒） |
+| `latency_ms` | int | 文字起こしにかかった時間（ミリ秒）。同じワーカーでの順番待ちの時間を含む |
 | `backend` | `"whisper"` \| `"haas"` | 使用したバックエンド |
 | `model` | string | 使用したモデル |
 
@@ -102,10 +113,34 @@ haas で extras が入っていない場合、理由は
 
 ## 3. 処理の流れ
 
-1. 拡張子を判定し、アップロードされた内容を同じ拡張子の一時ファイルに書き出す。
-2. 初回のリクエストで、設定されたバックエンドのモデルを読み込む（以降は使い回す）。
-   起動直後に `/health` だけを呼んでもモデルは読み込まれない。
-3. バックエンドで文字起こしする。一時ファイルは成否にかかわらず削除する。
+1. ワーカーの起動時（lifespan）に、設定されたバックエンドのモデルを読み込む。
+   読み込みに失敗してもワーカーは起動を続け、失敗をログに出す。その後の `/transcribe` で
+   読み込みを再試行し、失敗すれば `500` で理由を返す（extras 未導入などを利用者が知れるように）。
+2. 拡張子を判定し、アップロードされた内容を同じ拡張子の一時ファイルに書き出す。
+3. 同じワーカーで処理中の文字起こしがあれば、終わるまで待つ。
+4. バックエンドで文字起こしする。一時ファイルは成否にかかわらず削除する。
+
+### 3.0 並列処理
+
+- 並列化はワーカープロセスを増やして行う（`STT_WORKERS`）。各ワーカーがモデルを 1 つずつ持つ。
+  プロセス間で共有する状態が無いため、どちらのバックエンドでも同じ方法で並列にできる。
+  GPU メモリはワーカー数に比例して必要になる。
+- ワーカー内では推論を 1 件ずつ実行する（`SerialTranscriber`）。haas（NeMo）は `transcribe()` の
+  たびに前処理の dither・`pad_to` やモジュールの freeze 状態を書き換えて元に戻し、デコーダの
+  CUDA Graph も固定バッファを共有するため、同じモデルを複数スレッドから同時に呼べない。
+- 推論とモデルの読み込みは別スレッドで実行し、イベントループを止めない。推論中も `/health` や
+  ほかのリクエストのアップロード受信は処理される。順番待ちはイベントループ上のロック
+  （`asyncio.Lock`）で行い、待っているリクエストがスレッドプールを占有しないようにする。
+- 混雑時もリクエストを拒否せず、順番に処理する。ワーカー間の振り分けは OS の `accept` に任せる
+  ため、空いているワーカーがあっても処理中のワーカーに割り当てられ、待つことがある。
+- `STT_MAX_REQUESTS` が 1 以上のとき、uvicorn の `--limit-max-requests` で、指定件数を処理した
+  ワーカーを終了させる。メモリが肥大化しても、プロセスごと解放して元に戻すため。
+  - 終了するワーカーは処理中のリクエストを終えてから終了する。
+  - ワーカーが 2 つ以上なら uvicorn が新しいワーカーを起動する。ワーカーが 1 つのときは
+    プロセス全体が正常終了するため、systemd の `Restart=always` で起動し直す。
+  - 件数は uvicorn がすべての HTTP リクエスト（`/health` を含む）で数える。
+  - `STT_MAX_REQUESTS_JITTER` でワーカーごとに終了の件数をずらし、全ワーカーが同時に
+    モデルを読み込み直して処理が止まることを避ける。
 
 ### 3.1 whisper バックエンド
 
@@ -159,6 +194,8 @@ FastAPI の `HTTPBearer` で `Authorization` ヘッダを必須にし、`STT_API
 
 ## 6. テスト
 
-モデルはダミーに差し替え、GPU とモデル本体なしで実行する。haas バックエンドは
+モデルはダミーに差し替え、GPU とモデル本体なしで実行する。`SerialTranscriber` は、
+同時に投げた推論が重ならないこと、推論中もイベントループが進むこと、読み込みの失敗を
+次のリクエストで再試行することを検証する。haas バックエンドは
 `haas_asr` モジュールをダミーに差し替えて、読み込み・長尺処理の呼び出し・extras 未導入時の
 エラーを検証する。カバレッジが 80% を下回るとテストが失敗する。

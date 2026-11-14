@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Iterator
 from http import HTTPStatus
 from pathlib import Path
 
@@ -8,7 +9,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from stt_gateway import server
-from stt_gateway.transcription import Transcription, UnsupportedLanguageError
+from stt_gateway.config import Settings
+from stt_gateway.transcription import Transcriber, Transcription, UnsupportedLanguageError
 
 _FAKE_DURATION_SECONDS = 1.23
 
@@ -28,22 +30,31 @@ class _FakeTranscriber:
 
 
 @pytest.fixture(autouse=True)
-def no_auth_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """ローカルの.envの値に依存せず、デフォルトでは認証無効の状態でテストする。"""
-    monkeypatch.setattr(server, "settings", dataclasses.replace(server.settings, api_key=""))
+def default_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ローカルの.envの値に依存せず、whisper バックエンド・認証無効の状態でテストする。"""
+    monkeypatch.setattr(
+        server, "settings", dataclasses.replace(server.settings, backend="whisper", api_key="")
+    )
 
 
-@pytest.fixture
+def _use_backend(monkeypatch: pytest.MonkeyPatch, transcriber: Transcriber) -> None:
+    """設定に関係なく、指定したダミーをバックエンドとして読み込ませる。"""
+    monkeypatch.setattr(server, "load_transcriber", lambda _settings: transcriber)
+
+
+@pytest.fixture(autouse=True)
 def fake_model(monkeypatch: pytest.MonkeyPatch) -> _FakeTranscriber:
-    """バックエンドをダミーに差し替える。"""
+    """起動時の読み込みで実モデルを読まないよう、既定でバックエンドをダミーに差し替える。"""
     model = _FakeTranscriber()
-    monkeypatch.setattr(server, "get_transcriber", lambda: model)
+    _use_backend(monkeypatch, model)
     return model
 
 
 @pytest.fixture
-def client() -> TestClient:
-    return TestClient(server.app)
+def client() -> Iterator[TestClient]:
+    """lifespan（起動時のモデル読み込み）を実行した状態のクライアント。"""
+    with TestClient(server.app) as test_client:
+        yield test_client
 
 
 # HTTPBearer は STT_API_KEY 未設定でもヘッダ自体の有無は検証するため、
@@ -135,21 +146,20 @@ def test_transcribe_requires_bearer_token_when_api_key_set(
     assert res_wrong_token.status_code == HTTPStatus.UNAUTHORIZED
 
 
-def test_transcribe_returns_500_when_model_raises(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    class _BrokenTranscriber:
-        def transcribe(self, audio_path: Path, language: str) -> Transcription:
-            """常に失敗する。"""
-            raise RuntimeError("boom")
+class _BrokenTranscriber:
+    def transcribe(self, audio_path: Path, language: str) -> Transcription:
+        """常に失敗する。"""
+        raise RuntimeError("boom")
 
-    monkeypatch.setattr(server, "get_transcriber", lambda: _BrokenTranscriber())
 
-    res = client.post(
-        "/transcribe",
-        files={"file": ("sample.wav", b"RIFF....", "audio/wav")},
-        headers=_AUTH_HEADERS,
-    )
+def test_transcribe_returns_500_when_model_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    _use_backend(monkeypatch, _BrokenTranscriber())
+    with TestClient(server.app) as client:
+        res = client.post(
+            "/transcribe",
+            files={"file": ("sample.wav", b"RIFF....", "audio/wav")},
+            headers=_AUTH_HEADERS,
+        )
     assert res.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
     assert "boom" in res.json()["detail"]
 
@@ -183,57 +193,67 @@ def test_transcribe_removes_temporary_file(
     assert not audio_path.exists()
 
 
-def test_transcribe_returns_400_for_unsupported_language(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_transcribe_returns_400_for_unsupported_language(monkeypatch: pytest.MonkeyPatch) -> None:
     class _JapaneseOnlyTranscriber:
         def transcribe(self, audio_path: Path, language: str) -> Transcription:
             """日本語以外を拒否する。"""
             raise UnsupportedLanguageError("haas", language, ("ja",))
 
-    monkeypatch.setattr(server, "get_transcriber", lambda: _JapaneseOnlyTranscriber())
-
-    res = client.post(
-        "/transcribe",
-        files={"file": ("sample.wav", b"RIFF....", "audio/wav")},
-        data={"language": "en"},
-        headers=_AUTH_HEADERS,
-    )
+    _use_backend(monkeypatch, _JapaneseOnlyTranscriber())
+    with TestClient(server.app) as client:
+        res = client.post(
+            "/transcribe",
+            files={"file": ("sample.wav", b"RIFF....", "audio/wav")},
+            data={"language": "en"},
+            headers=_AUTH_HEADERS,
+        )
     assert res.status_code == HTTPStatus.BAD_REQUEST
     assert "'en'" in res.json()["detail"]
 
 
+def test_model_is_loaded_at_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+    loaded: list[Settings] = []
+
+    def _count_loads(settings: Settings) -> _FakeTranscriber:
+        """読み込み回数を数える。"""
+        loaded.append(settings)
+        return _FakeTranscriber()
+
+    monkeypatch.setattr(server, "load_transcriber", _count_loads)
+    with TestClient(server.app) as client:
+        assert len(loaded) == 1, "リクエスト前の起動時に読み込まれること"
+        client.post(
+            "/transcribe",
+            files={"file": ("sample.wav", b"RIFF....", "audio/wav")},
+            headers=_AUTH_HEADERS,
+        )
+    assert len(loaded) == 1, "リクエストのたびに読み込み直さないこと"
+
+
 def test_transcribe_returns_500_when_backend_cannot_load(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    def _fail_to_load() -> None:
+    def _fail_to_load(_settings: Settings) -> Transcriber:
         """extras 未導入でモデルを読み込めない状況を再現する。"""
         raise RuntimeError("requires the 'haas' extra")
 
-    monkeypatch.setattr(server, "get_transcriber", _fail_to_load)
+    monkeypatch.setattr(server, "load_transcriber", _fail_to_load)
+    with TestClient(server.app) as client:
+        assert "failed to preload transcriber" in caplog.text, "起動は続け、失敗をログに残すこと"
+        res = client.post(
+            "/transcribe",
+            files={"file": ("sample.wav", b"RIFF....", "audio/wav")},
+            headers=_AUTH_HEADERS,
+        )
+    assert res.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
+    assert "haas" in res.json()["detail"]
 
-    res = client.post(
+
+def test_transcribe_fails_without_lifespan(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delattr(server.app.state, "serial_transcriber", raising=False)
+    res = TestClient(server.app, raise_server_exceptions=False).post(
         "/transcribe",
         files={"file": ("sample.wav", b"RIFF....", "audio/wav")},
         headers=_AUTH_HEADERS,
     )
     assert res.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
-    assert "haas" in res.json()["detail"]
-
-
-def test_get_transcriber_loads_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    loaded: list[object] = []
-
-    def _fake_load(settings: object) -> _FakeTranscriber:
-        """読み込み回数を数える。"""
-        loaded.append(settings)
-        return _FakeTranscriber()
-
-    monkeypatch.setattr(server, "load_transcriber", _fake_load)
-    server.get_transcriber.cache_clear()
-    try:
-        first = server.get_transcriber()
-        assert server.get_transcriber() is first
-        assert len(loaded) == 1
-    finally:
-        server.get_transcriber.cache_clear()
