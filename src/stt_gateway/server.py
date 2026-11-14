@@ -12,7 +12,16 @@ from pathlib import Path
 from typing import Annotated
 
 import httpx
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Security, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Security,
+    UploadFile,
+)
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
@@ -56,6 +65,7 @@ def build_stream_dependencies(
         default_language=settings.language,
         max_utterance_seconds=settings.stream_max_utterance_seconds,
         backchannel=settings.backchannel,
+        ack=settings.ack,
     )
 
 

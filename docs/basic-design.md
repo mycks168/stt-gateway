@@ -13,6 +13,7 @@ uvicorn（STT_WORKERS 個のワーカープロセス）
                             ├─ backchannel_pool.py … 予測器の貸し出し（上限つき）
                             ├─ backchannel_policy.py ◀─ BackchannelPredictor（Protocol）
                             │                             └─ maai_backchannel.py … MaAI vap_bc_jp（CPU）
+                            ├─ stream_options.py … 発話ごとの指定とサーバの設定の合成
                             ├─ ack_generator.py … Ollama の軽量 LLM
                             │    ├─ ack_prompt.py … プロンプトと会話例
                             │    └─ ack_text.py … LLM 出力の整形と検証
@@ -47,7 +48,8 @@ uvicorn（STT_WORKERS 個のワーカープロセス）
 | `maai_backchannel.py` | MaAI（`vap_bc_jp`）で相槌の確率を予測する |
 | `backchannel_pool.py` | ワーカー内の予測器を上限数まで用意して貸し出す。上限に達していれば貸さない |
 | `ack_generator.py` | Ollama の軽量 LLM で一時的な返事を作り、失敗時は固定の文言に差し替える |
-| `ack_prompt.py` | 一時的な返事を作るためのシステムプロンプトと会話例、chat API のメッセージ列の組み立て（純粋なロジック） |
+| `ack_prompt.py` | 一時的な返事の既定のシステムプロンプトと会話例、chat API のメッセージ列の組み立て（純粋なロジック） |
+| `stream_options.py` | `start` の `ack`・`backchannel` の指定とサーバの設定から、発話ごとの設定を決める（純粋なロジック） |
 | `ack_text.py` | LLM 出力の整形と、返してよい文かどうかの検証（純粋なロジック） |
 | `stream_audio_decoder.py` | 受信した Opus パケットまたは PCM バイト列を、16kHz モノラルの波形に変換する。Opus はデコーダの状態を発話ごとに持つ |
 | `pcm_audio.py` | PCM バイト列と波形の相互変換、波形から WAV への書き出し（純粋なロジック） |
@@ -182,7 +184,7 @@ haas で extras が入っていない場合、理由は
 
 | 種類 | 形式 | 内容 |
 |---|---|---|
-| 発話の開始 | テキスト（JSON） | `{"type": "start", "encoding": "opus", "language": "ja"}`。`encoding` と `language` は省略可（省略時は `opus` と `STT_LANGUAGE`） |
+| 発話の開始 | テキスト（JSON） | `{"type": "start", "encoding": "opus", "language": "ja", "ack": {...}, "backchannel": {...}}`。`type` 以外は省略可（省略時は `opus`・`STT_LANGUAGE`・サーバの設定）。`ack` と `backchannel` は下の「発話ごとの指定」 |
 | 音声 | バイナリ | `encoding` に従う（下表） |
 | 発話の終了 | テキスト（JSON） | `{"type": "end"}` |
 
@@ -201,6 +203,47 @@ haas で extras が入っていない場合、理由は
 - `end` を送った後、その発話の結果を待たずに次の `start` を送ってよい。
 - 言語は `ja` のみ対応する。相槌の予測モデルが日本語用のため。
 
+#### 発話ごとの指定（`start` の `ack` と `backchannel`）
+
+一時的な返事と相槌は、どんな言い方が合うかがクライアントによって違う。たとえば、この後に
+エージェントの本回答が続くクライアントでは、ack が内容を受け止めると本回答と同じ受け止めが
+2 回続くため、中身のない「つなぎ」の一言が合う。そのため、発話ごとにクライアントが指定できる。
+指定しない項目は、サーバの設定（2.1）と既定のプロンプト（下の「一時的な返事の作り方」）を使う。
+
+`ack`：`false` を指定すると、その発話では一時的な返事を作らない（`transcript` で終わる）。
+オブジェクトの場合のフィールドは次のとおり。
+
+| フィールド | 型・範囲 | 省略時 |
+|---|---|---|
+| `system_prompt` | 文字列、1〜2,000 文字 | 既定のシステムプロンプト |
+| `examples` | `{"user": 1〜200 文字, "reply": 1〜100 文字}` の配列、0〜8 個 | `system_prompt` も省略したときは既定の会話例、`system_prompt` を指定したときは会話例なし |
+| `fallback_text` | 文字列、1〜50 文字 | `STT_ACK_FALLBACK_TEXT` |
+| `max_chars` | 整数、1〜100 | `STT_ACK_MAX_CHARS` |
+
+- `system_prompt` を指定して `examples` を省略したときに既定の会話例を使わないのは、既定の
+  会話例が既定のシステムプロンプトの言い方（相手の言葉を繰り返す）に合わせてあり、別の
+  プロンプトと混ぜると指示と例が食い違うため。
+- 推論の設定（モデル、`think`、`temperature`、出力の上限）と、出力の整形・固定の文言への
+  差し替えの規則は、指定によらず同じ。
+- クライアントが書くプロンプトも、既定と同じく「答えを知らない聞き手」として書き出す必要がある。
+  「音声アシスタントのつなぎ役」として書いた版では、`gemma4:e2b` が 6 件中 3 件を韓国語で返し、
+  天気の質問に「明日の天気は晴れだよ。」と言い切った。サーバは出力の言語や内容の正しさを
+  検証しないため、README にプロンプトの書き方を示す。
+
+`backchannel`：
+
+| フィールド | 型・範囲 | 省略時 |
+|---|---|---|
+| `phrases` | 文字列（1〜20 文字）の配列、1〜10 個 | `STT_BACKCHANNEL_PHRASES` |
+| `threshold` | 数値、0 より大きく 1 以下 | `STT_BACKCHANNEL_THRESHOLD` |
+| `min_interval_ms` | 整数、0〜60,000 | `STT_BACKCHANNEL_MIN_INTERVAL_MS` |
+
+- 範囲外の値、型の誤り、未知のフィールド（`system_promt` のような綴りの誤りを黙って無視しない
+  ため）は `invalid_message` になり、その発話は始まらない。
+- 文言は接続の中で順番を引き継ぐ。前の発話と `phrases` が違う場合は、新しい `phrases` の
+  先頭から使う。
+- 予測器の上限（`STT_BACKCHANNEL_MAX_SESSIONS`）はクライアントから変えられない。
+
 #### サーバが送るイベント（テキスト・JSON）
 
 すべてのイベントに `type` と、発話の通し番号 `utterance_id`（接続ごとに 1 から）を付ける。
@@ -216,7 +259,7 @@ haas で extras が入っていない場合、理由は
 
 - 1 つの発話について、`transcript` は必ず `ack` より先に送る。一時的な返事は文字起こしの結果から
   作るため。
-- 文字起こしの結果が空（無音など）の場合、`ack` は送らない。
+- 文字起こしの結果が空（無音など）の場合と、`start` で `"ack": false` を指定した場合は、`ack` は送らない。
 - 音声を 1 つも送らずに `end` を送った発話は、文字起こしせずに `text` が空・`duration` が 0 の
   `transcript` を返す。
 - `backchannel` は `start` から `end` までの音声に対してだけ送る。`end` の後に予測が
@@ -227,7 +270,7 @@ haas で extras が入っていない場合、理由は
 
 | `code` | 条件 | 接続 |
 |---|---|---|
-| `invalid_message` | JSON として読めない、`type` や `encoding` が不明 | 継続 |
+| `invalid_message` | JSON として読めない、`type` や `encoding` が不明、`ack`・`backchannel` の指定が範囲外・未知のフィールド | 継続（`start` ならその発話は始まらない） |
 | `invalid_audio` | Opus のパケットをデコードできない、`pcm_s16le` で奇数バイト | 継続（そのメッセージの音声は捨てる） |
 | `invalid_state` | 発話中に `start`、発話中でないときに音声または `end` | 継続 |
 | `unsupported_language` | `ja` 以外の言語 | 継続（その発話は始まらない） |
@@ -239,23 +282,25 @@ haas で extras が入っていない場合、理由は
 #### 相槌の決め方
 
 - 予測モデルは 100ms ごとに「今、相槌を打つべき確率」を出す。
-- 確率が `STT_BACKCHANNEL_THRESHOLD` を下から上へ超えたフレームで 1 回だけ相槌を出す
-  （超えている間に何度も出さない）。
-- 前の相槌から `STT_BACKCHANNEL_MIN_INTERVAL_MS` 経っていなければ出さない。
-  `offset_ms`（音声上の時刻）で測る。
-- 文言は `STT_BACKCHANNEL_PHRASES` を順に使う。同じ文言が続かないようにするため。
+- 確率がしきい値（`backchannel.threshold`、省略時は `STT_BACKCHANNEL_THRESHOLD`）を下から上へ
+  超えたフレームで 1 回だけ相槌を出す（超えている間に何度も出さない）。
+- 前の相槌から最短の間隔（`backchannel.min_interval_ms`、省略時は `STT_BACKCHANNEL_MIN_INTERVAL_MS`）
+  が経っていなければ出さない。`offset_ms`（音声上の時刻）で測る。
+- 文言（`backchannel.phrases`、省略時は `STT_BACKCHANNEL_PHRASES`）を順に使う。同じ文言が続かない
+  ようにするため。
 
 #### 一時的な返事の作り方
 
-Ollama の `/api/chat` に、次のシステムプロンプトと会話例を付けて文字起こし結果を渡す。
+Ollama の `/api/chat` に、システムプロンプトと会話例を付けて文字起こし結果を渡す。
+クライアントが `start` の `ack` で指定しなければ、次の既定のものを使う。
 「アシスタント」として指示すると小型の LLM は質問に答えようとし、事実でない内容を言い切るため、
 答えを知らない「聞き手」として相槌を打たせる。
 
-システムプロンプト：
+既定のシステムプロンプト：
 
 > あなたは会話の聞き手です。相手の話を聞いて、相槌を一言だけ打ちます。あなたは答えを知らないので、質問や依頼には答えず「調べるね」「確認するね」のように受け止めるだけにします。相手の言葉を少しだけ繰り返してもよいです。15文字以内、くだけた口調、1文だけ。
 
-会話例（ユーザー → 返事）：
+既定の会話例（ユーザー → 返事）：
 
 | ユーザー | 返事 |
 |---|---|
@@ -266,9 +311,10 @@ Ollama の `/api/chat` に、次のシステムプロンプトと会話例を付
 
 - 推論の設定：思考モードを使わない（`think: false`）、`temperature` 0.3、出力の上限 40 トークン。
 - 出力は前後の空白と引用符（`「」"'`）を取り除き、最初の 1 行だけを使う。
-- 次の場合は `STT_ACK_FALLBACK_TEXT` を `source: "fallback"` で返す。
+- 次の場合は固定の文言（`ack.fallback_text`、省略時は `STT_ACK_FALLBACK_TEXT`）を
+  `source: "fallback"` で返す。
   - `STT_ACK_TIMEOUT_MS` 以内に応答が無い、接続できない、応答が読めない
-  - 整形後の文字数が 0、または `STT_ACK_MAX_CHARS` を超える
+  - 整形後の文字数が 0、または文字数の上限（`ack.max_chars`、省略時は `STT_ACK_MAX_CHARS`）を超える
 
 ## 3. 処理の流れ
 
@@ -427,6 +473,8 @@ FastAPI の `HTTPBearer` で `Authorization` ヘッダを必須にし、`STT_API
 - メッセージの順序の誤り（発話中の `start` など）と、各 `error` の `code`
 - 1 発話で `started` → `backchannel` → `transcript` → `ack` の順にイベントが届くこと
 - 相槌の決め方（しきい値の立ち上がり、最短の間隔、文言の順番、`end` 後の予測を送らないこと）
+- `start` の `ack`・`backchannel` の指定が使われること、省略した項目がサーバの設定になること、
+  範囲外の指定が `invalid_message` になること、`ack: false` で ack を送らないこと
 - 一時的な返事の整形と、タイムアウト・接続失敗・文字数超過のときの固定文言への差し替え
 - Opus パケットと PCM のデコード（実際に PyAV でエンコードした Opus を使う）と、壊れたパケットの扱い
 

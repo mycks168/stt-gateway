@@ -7,7 +7,8 @@ from collections.abc import Callable, Coroutine
 import httpx
 import pytest
 
-from stt_gateway.ack_generator import Ack, AckGenerator
+from stt_gateway.ack_generator import Ack, AckGenerator, AckRequest
+from stt_gateway.ack_prompt import DEFAULT_ACK_PROMPT, AckPrompt
 from stt_gateway.config import AckSettings
 
 _SETTINGS = AckSettings(
@@ -19,6 +20,8 @@ _SETTINGS = AckSettings(
     keep_alive="30m",
 )
 
+_DEFAULT_REQUEST = AckRequest(DEFAULT_ACK_PROMPT, "ちょっと確認するね。", 20)
+
 Handler = Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]
 
 
@@ -29,12 +32,14 @@ def _reply(content: str) -> httpx.Response:
     )
 
 
-def _generate(handler: Handler, transcript: str = "明日の天気は？") -> Ack:
+def _generate(
+    handler: Handler, transcript: str = "明日の天気は？", request: AckRequest = _DEFAULT_REQUEST
+) -> Ack:
     """ダミーの Ollama につないだ AckGenerator で返事を 1 つ作る。"""
 
     async def scenario() -> Ack:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            return await AckGenerator(_SETTINGS, client).generate(transcript)
+            return await AckGenerator(_SETTINGS, client).generate(transcript, request)
 
     return asyncio.run(scenario())
 
@@ -113,3 +118,20 @@ def test_warm_up_requests_once_and_ignores_failure(caplog: pytest.LogCaptureFixt
     asyncio.run(scenario())
     assert len(requests) == 1
     assert "ack warm-up failed" in caplog.text
+
+
+def test_generate_uses_request_prompt_limit_and_fallback() -> None:
+    requests: list[httpx.Request] = []
+    request = AckRequest(AckPrompt("つなぎ役です。", ()), "えっと、ちょっと待ってね。", 5)
+
+    async def handler(http_request: httpx.Request) -> httpx.Response:
+        """リクエストを記録して、上限の 5 文字を超える返事を返す。"""
+        requests.append(http_request)
+        return _reply("ちょっと見てみるね。")
+
+    assert _generate(handler, request=request) == Ack("えっと、ちょっと待ってね。", "fallback")
+    messages = json.loads(requests[0].content)["messages"]
+    assert messages == [
+        {"role": "system", "content": "つなぎ役です。"},
+        {"role": "user", "content": "明日の天気は？"},
+    ]

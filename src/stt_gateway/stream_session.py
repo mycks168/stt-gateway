@@ -14,12 +14,12 @@ from typing import Protocol
 import numpy as np
 from pydantic import ValidationError
 
-from .ack_generator import AckGenerator
+from .ack_generator import AckGenerator, AckRequest
 from .audio_decoding import AudioSamples
 from .backchannel_policy import BackchannelPredictor, BackchannelTrigger, PhraseRotation
 from .backchannel_pool import BackchannelPool, LeasedPredictor
 from .backends import BackendDescription
-from .config import BackchannelSettings
+from .config import AckSettings, BackchannelSettings
 from .pcm_audio import write_wav
 from .serial_transcriber import SerialTranscriber
 from .stream_audio_decoder import (
@@ -40,6 +40,11 @@ from .stream_messages import (
     StreamEvent,
     TranscriptEvent,
     UtteranceId,
+)
+from .stream_options import (
+    BackchannelRule,
+    resolve_ack_request,
+    resolve_backchannel_rule,
 )
 from .transcription import Transcription
 
@@ -69,6 +74,7 @@ class StreamDependencies:
     default_language: str
     max_utterance_seconds: float
     backchannel: BackchannelSettings
+    ack: AckSettings
 
 
 class _BackchannelStream:
@@ -164,6 +170,7 @@ class _ReceivingUtterance:
     language: str
     decoder: StreamAudioDecoder
     backchannel: _BackchannelStream | None
+    ack_request: AckRequest | None
     chunks: list[AudioSamples] = field(default_factory=list)
     sample_count: int = 0
 
@@ -177,11 +184,12 @@ class _DiscardingUtterance:
 
 @dataclass(frozen=True)
 class _FinishedUtterance:
-    """end を受け取り、文字起こしと一時的な返事を作る発話。"""
+    """end を受け取り、文字起こしと一時的な返事を作る発話。ack_request が None なら返事は作らない。"""
 
     utterance_id: UtteranceId
     language: str
     samples: AudioSamples
+    ack_request: AckRequest | None
 
 
 class StreamSession:
@@ -191,7 +199,8 @@ class StreamSession:
         """共有の部品と、イベントの送り先を受け取る。"""
         self._dependencies = dependencies
         self._sender = sender
-        self._rotation = PhraseRotation(dependencies.backchannel.phrases)
+        self._rotation_phrases = dependencies.backchannel.phrases
+        self._rotation = PhraseRotation(self._rotation_phrases)
         self._current: _ReceivingUtterance | _DiscardingUtterance | None = None
         self._last_utterance_id = 0
         self._background_tasks: set[asyncio.Task[None]] = set()
@@ -269,14 +278,19 @@ class StreamSession:
             return
         self._last_utterance_id += 1
         utterance_id = UtteranceId(self._last_utterance_id)
+        rule = resolve_backchannel_rule(message.backchannel, self._dependencies.backchannel)
         lease = await self._dependencies.backchannel_pool.acquire()
         backchannel = (
-            self._start_backchannel(utterance_id, lease)
+            self._start_backchannel(utterance_id, lease, rule)
             if isinstance(lease, LeasedPredictor)
             else None
         )
         self._current = _ReceivingUtterance(
-            utterance_id, language, create_stream_audio_decoder(message.encoding), backchannel
+            utterance_id,
+            language,
+            create_stream_audio_decoder(message.encoding),
+            backchannel,
+            resolve_ack_request(message.ack, self._dependencies.ack),
         )
         await self._sender.send(
             StartedEvent(
@@ -289,11 +303,12 @@ class StreamSession:
         )
 
     def _start_backchannel(
-        self, utterance_id: UtteranceId, lease: LeasedPredictor
+        self, utterance_id: UtteranceId, lease: LeasedPredictor, rule: BackchannelRule
     ) -> _BackchannelStream:
         """借りた予測器で、この発話の相槌の予測を始める。"""
-        settings = self._dependencies.backchannel
-        trigger = BackchannelTrigger(settings.threshold, settings.min_interval_ms, self._rotation)
+        trigger = BackchannelTrigger(
+            rule.threshold, rule.min_interval_ms, self._rotation_for(rule.phrases)
+        )
         return _BackchannelStream(
             utterance_id,
             lease.predictor,
@@ -301,6 +316,13 @@ class StreamSession:
             self._dependencies.backchannel_pool,
             self._sender,
         )
+
+    def _rotation_for(self, phrases: tuple[str, ...]) -> PhraseRotation:
+        """文言の順番を返す。前の発話と文言が違うときは、新しい文言の先頭から数え直す。"""
+        if phrases != self._rotation_phrases:
+            self._rotation_phrases = phrases
+            self._rotation = PhraseRotation(phrases)
+        return self._rotation
 
     async def _end_utterance(self, message: EndMessage) -> None:
         """発話を終え、文字起こしと一時的な返事をバックグラウンドで作る。"""
@@ -319,7 +341,11 @@ class StreamSession:
             np.concatenate(utterance.chunks) if utterance.chunks else np.zeros(0, dtype=np.float32)
         )
         self._spawn(
-            self._finish(_FinishedUtterance(utterance.utterance_id, utterance.language, samples))
+            self._finish(
+                _FinishedUtterance(
+                    utterance.utterance_id, utterance.language, samples, utterance.ack_request
+                )
+            )
         )
 
     async def _discard_too_long(self, utterance: _ReceivingUtterance) -> None:
@@ -335,10 +361,12 @@ class StreamSession:
     async def _finish(self, utterance: _FinishedUtterance) -> None:
         """文字起こし結果を送り、文字起こしできたら一時的な返事を送る。"""
         transcript = await self._send_transcript(utterance)
-        if transcript is None or not transcript.text:
+        if transcript is None or not transcript.text or utterance.ack_request is None:
             return
         sent_at = time.perf_counter()
-        ack = await self._dependencies.ack_generator.generate(transcript.text)
+        ack = await self._dependencies.ack_generator.generate(
+            transcript.text, utterance.ack_request
+        )
         await self._sender.send(
             AckEvent(
                 utterance_id=utterance.utterance_id,

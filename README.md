@@ -171,7 +171,7 @@ curl -X POST http://127.0.0.1:23000/transcribe \
 #### クライアントから送るもの
 | 種類 | 形式 | 内容 |
 |---|---|---|
-| 発話の開始 | テキスト（JSON） | `{"type": "start", "encoding": "opus", "language": "ja"}`。`encoding` と `language` は省略できる（省略時は `opus` と `STT_LANGUAGE`） |
+| 発話の開始 | テキスト（JSON） | `{"type": "start", "encoding": "opus", "language": "ja"}`。`type` 以外は省略できる（省略時は `opus` と `STT_LANGUAGE`）。一時的な返事と相槌の指定（`ack`・`backchannel`）も付けられる（下記） |
 | 音声 | バイナリ | `encoding` が `opus` なら Opus のパケット 1 つ（Ogg などのコンテナに入れない）。`pcm_s16le` なら 16kHz・モノラル・16bit リトルエンディアンの PCM |
 | 発話の終了 | テキスト（JSON） | `{"type": "end"}` |
 
@@ -179,6 +179,43 @@ curl -X POST http://127.0.0.1:23000/transcribe \
   パケットは 1 つずつ、エンコードした順に送る。
 - 言語は `ja` だけ。
 - `end` を送ったら、結果を待たずに次の `start` を送ってよい。
+
+#### 一時的な返事と相槌を発話ごとに指定する
+`start` に `ack` と `backchannel` を付けると、その発話だけサーバの設定の代わりに使う。
+省略した項目はサーバの設定のまま。
+
+例：この後に別の本回答が続くクライアント向けに、相手の言葉を繰り返さない一言にする。
+```json
+{"type": "start", "encoding": "opus",
+ "ack": {
+   "system_prompt": "あなたは会話の聞き手です。相手の話を聞いて、相槌を一言だけ打ちます。あなたは答えを知らないので、質問や依頼には答えず「ちょっと見てみるね」「考えるね」のように受け止めるだけにします。相手の言葉は繰り返しません。聞き返しもしません。日本語で、15文字以内、くだけた口調、1文だけ。",
+   "examples": [
+     {"user": "明日の天気ってどう？", "reply": "ちょっと見てみるね。"},
+     {"user": "なんか最近調子悪いんだよね", "reply": "そっか、ちょっと考えるね。"},
+     {"user": "この関数どこで呼ばれてるんだっけ", "reply": "うん、探してみる。"},
+     {"user": "お疲れさま、今日はもういいよ", "reply": "うん、お疲れさま！"}
+   ],
+   "fallback_text": "えっと、ちょっと待ってね。"
+ },
+ "backchannel": {"phrases": ["はい", "ええ"], "threshold": 0.4, "min_interval_ms": 1200}}
+```
+
+| フィールド | 範囲 | 省略時 |
+|---|---|---|
+| `ack.system_prompt` | 1〜2,000 文字 | 既定のプロンプト（相手の言葉を少し繰り返して受け止める） |
+| `ack.examples` | `user`（1〜200 文字）と `reply`（1〜100 文字）の組、0〜8 個 | `system_prompt` も省略したときは既定の例、`system_prompt` を指定したときは例なし |
+| `ack.fallback_text` | 1〜50 文字 | `STT_ACK_FALLBACK_TEXT` |
+| `ack.max_chars` | 1〜100 | `STT_ACK_MAX_CHARS` |
+| `backchannel.phrases` | 1〜20 文字の文言、1〜10 個 | `STT_BACKCHANNEL_PHRASES` |
+| `backchannel.threshold` | 0 より大きく 1 以下 | `STT_BACKCHANNEL_THRESHOLD` |
+| `backchannel.min_interval_ms` | 0〜60,000 | `STT_BACKCHANNEL_MIN_INTERVAL_MS` |
+
+- `"ack": false` にすると、その発話では一時的な返事が届かない。
+- 範囲外の値や知らないフィールドがあると `invalid_message` が届き、その発話は始まらない。
+- 一時的な返事を作るモデルは、クライアントからは変えられない（`STT_ACK_MODEL`）。
+- プロンプトは「会話の聞き手」として書き出し、「答えを知らない」「日本語で」を入れる。
+  「アシスタント」や「つなぎ役」として書くと、質問に答えて事実でない内容を言い切ったり、
+  日本語以外で返したりすることがある（`gemma4:e2b` で確認）。
 
 #### サーバから届くもの（テキスト・JSON）
 | `type` | 届くとき | 主なフィールド |
@@ -192,11 +229,11 @@ curl -X POST http://127.0.0.1:23000/transcribe \
 - すべてに `utterance_id`（接続ごとに 1 から振る発話の番号）が付く。
 - 1 つの発話では `transcript` が先、`ack` が後に届く。
 - 相槌は `start` から `end` までの間だけ届く。
-- 文字起こし結果が空のときは `ack` は届かない。
+- 文字起こし結果が空のとき、または `"ack": false` のときは `ack` は届かない。
 
 | `code` | 条件 |
 |---|---|
-| `invalid_message` | JSON として読めない、`type` や `encoding` が不明 |
+| `invalid_message` | JSON として読めない、`type` や `encoding` が不明、`ack`・`backchannel` の指定が範囲外 |
 | `invalid_audio` | Opus のパケットをデコードできない、PCM のバイト数が奇数 |
 | `invalid_state` | 発話中に `start`、発話中でないときに音声や `end` |
 | `unsupported_language` | `ja` 以外の言語 |

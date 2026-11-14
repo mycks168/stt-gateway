@@ -10,7 +10,7 @@ from typing import Literal
 import httpx
 from pydantic import BaseModel, ValidationError
 
-from .ack_prompt import build_ack_messages
+from .ack_prompt import DEFAULT_ACK_PROMPT, AckPrompt, build_ack_messages
 from .ack_text import normalize_ack_text
 from .config import AckSettings
 
@@ -35,6 +35,15 @@ class Ack:
     source: AckSource
 
 
+@dataclass(frozen=True)
+class AckRequest:
+    """1 つの発話の一時的な返事の作り方。クライアントの指定とサーバの設定から決まる。"""
+
+    prompt: AckPrompt
+    fallback_text: str
+    max_chars: int
+
+
 class _OllamaMessage(BaseModel):
     """Ollama chat API の応答のうち、使う部分。"""
 
@@ -55,11 +64,13 @@ class AckGenerator:
         self._settings = settings
         self._client = client
 
-    async def generate(self, transcript_text: str) -> Ack:
+    async def generate(self, transcript_text: str, request: AckRequest) -> Ack:
         """一時的な返事を作る。時間切れ・失敗・長すぎる場合は固定の文言を返す。"""
         timeout_seconds = self._settings.timeout_ms / MILLISECONDS_PER_SECOND
         try:
-            raw_text = await asyncio.wait_for(self._request_reply(transcript_text), timeout_seconds)
+            raw_text = await asyncio.wait_for(
+                self._request_reply(transcript_text, request.prompt), timeout_seconds
+            )
         except (asyncio.TimeoutError, httpx.HTTPError, ValidationError) as error:
             logger.warning(
                 "ack generation failed (url=%s, model=%s): %r; using fallback text",
@@ -67,21 +78,21 @@ class AckGenerator:
                 self._settings.model,
                 error,
             )
-            return self._fallback()
-        text = normalize_ack_text(raw_text, self._settings.max_chars)
+            return self._fallback(request)
+        text = normalize_ack_text(raw_text, request.max_chars)
         if text is None:
             logger.info(
                 "ack text rejected (model=%s): %r; using fallback text",
                 self._settings.model,
                 raw_text,
             )
-            return self._fallback()
+            return self._fallback(request)
         return Ack(text, "llm")
 
     async def warm_up(self) -> None:
         """モデルを GPU に読み込ませておく。最初の返事がモデルの読み込みを待たないようにするため。"""
         try:
-            await self._request_reply(WARMUP_TEXT)
+            await self._request_reply(WARMUP_TEXT, DEFAULT_ACK_PROMPT)
         except (httpx.HTTPError, ValidationError) as error:
             logger.warning(
                 "ack warm-up failed (url=%s, model=%s): %r",
@@ -95,7 +106,7 @@ class AckGenerator:
         """Ollama chat API の URL。"""
         return f"{self._settings.ollama_url}{OLLAMA_CHAT_PATH}"
 
-    async def _request_reply(self, transcript_text: str) -> str:
+    async def _request_reply(self, transcript_text: str, prompt: AckPrompt) -> str:
         """Ollama に返事を 1 つ作らせ、本文を返す。"""
         response = await self._client.post(
             self._chat_url,
@@ -108,12 +119,13 @@ class AckGenerator:
                     "temperature": OLLAMA_TEMPERATURE,
                     "num_predict": OLLAMA_MAX_OUTPUT_TOKENS,
                 },
-                "messages": build_ack_messages(transcript_text),
+                "messages": build_ack_messages(transcript_text, prompt),
             },
         )
         response.raise_for_status()
         return _OllamaChatResponse.model_validate_json(response.content).message.content
 
-    def _fallback(self) -> Ack:
+    @staticmethod
+    def _fallback(request: AckRequest) -> Ack:
         """固定の文言の返事を作る。"""
-        return Ack(self._settings.fallback_text, "fallback")
+        return Ack(request.fallback_text, "fallback")

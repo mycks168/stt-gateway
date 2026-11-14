@@ -104,6 +104,7 @@ def _session(
         default_language="ja",
         max_utterance_seconds=60,
         backchannel=_BACKCHANNEL_SETTINGS,
+        ack=_ACK_SETTINGS,
     )
     return StreamSession(dependencies, sender)
 
