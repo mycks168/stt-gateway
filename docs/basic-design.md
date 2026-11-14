@@ -5,9 +5,21 @@
 ```
 uvicorn（STT_WORKERS 個のワーカープロセス）
   └─ ワーカーごとに:
-クライアント ──HTTP──▶ server.py（API・認証）
-                          ▼
-              serial_transcriber.py（推論を 1 件ずつ実行）
+クライアント ──HTTP──▶ server.py（API・認証・lifespan で /stream の部品を用意）
+          └──WebSocket──▶ stream_api.py（/stream・認証）
+                               │    auth.py … Bearer トークンの検証（/transcribe と共有）
+                               ▼
+                          stream_session.py（1 接続の発話の進行）
+                            ├─ backchannel_pool.py … 予測器の貸し出し（上限つき）
+                            ├─ backchannel_policy.py ◀─ BackchannelPredictor（Protocol）
+                            │                             └─ maai_backchannel.py … MaAI vap_bc_jp（CPU）
+                            ├─ ack_generator.py … Ollama の軽量 LLM
+                            │    ├─ ack_prompt.py … プロンプトと会話例
+                            │    └─ ack_text.py … LLM 出力の整形と検証
+                            ├─ stream_audio_decoder.py … Opus / PCM から波形への変換
+                            └─ pcm_audio.py … 波形と WAV の変換
+                          ▼（発話の終了時）
+              serial_transcriber.py（推論を 1 件ずつ実行。/transcribe と共有）
                           │ Transcriber（Protocol）
                           ▼
               backends.py（設定でバックエンドを選ぶ）
@@ -18,7 +30,8 @@ uvicorn（STT_WORKERS 個のワーカープロセス）
 
 | モジュール | 責務 |
 |---|---|
-| `server.py` | HTTP API、Bearer 認証、一時ファイルの管理、例外から HTTP ステータスへの変換、起動時のモデル読み込み |
+| `server.py` | HTTP API、Bearer 認証、一時ファイルの管理、例外から HTTP ステータスへの変換、起動時のモデル読み込みと `/stream` 用の部品（予測器の貸し出し・一時的な返事の作成）の用意 |
+| `auth.py` | Bearer トークンの取り出しと、API キーとの比較（`/transcribe` と `/stream` で共有） |
 | `serial_transcriber.py` | ワーカー内でのモデルの保持と、推論を 1 件ずつ別スレッドで実行する順番待ち |
 | `config.py` | 環境変数（`.env` を含む）の読み込みと検証 |
 | `formats.py` | 拡張子による音声フォーマットの判定 |
@@ -27,9 +40,28 @@ uvicorn（STT_WORKERS 個のワーカープロセス）
 | `whisper_backend.py` | faster-whisper による文字起こし |
 | `haas_backend.py` | Haas-ja による文字起こし |
 | `audio_decoding.py` | PyAV(ffmpeg) による音声ファイルから波形へのデコード（haas が使う） |
+| `stream_api.py` | `/stream` の WebSocket 受け付け、認証、受信メッセージの解釈 |
+| `stream_messages.py` | `/stream` で送受信するメッセージの型（Pydantic） |
+| `stream_session.py` | 1 接続の中での発話の開始・音声の受け取り・終了の進行と、イベントの送信 |
+| `backchannel_policy.py` | 相槌の確率の列から、相槌を出すかどうかと文言を決める（純粋なロジック）。予測器のインタフェース（`BackchannelPredictor`）もここに置く |
+| `maai_backchannel.py` | MaAI（`vap_bc_jp`）で相槌の確率を予測する |
+| `backchannel_pool.py` | ワーカー内の予測器を上限数まで用意して貸し出す。上限に達していれば貸さない |
+| `ack_generator.py` | Ollama の軽量 LLM で一時的な返事を作り、失敗時は固定の文言に差し替える |
+| `ack_prompt.py` | 一時的な返事を作るためのシステムプロンプトと会話例、chat API のメッセージ列の組み立て（純粋なロジック） |
+| `ack_text.py` | LLM 出力の整形と、返してよい文かどうかの検証（純粋なロジック） |
+| `stream_audio_decoder.py` | 受信した Opus パケットまたは PCM バイト列を、16kHz モノラルの波形に変換する。Opus はデコーダの状態を発話ごとに持つ |
+| `pcm_audio.py` | PCM バイト列と波形の相互変換、波形から WAV への書き出し（純粋なロジック） |
 
 依存の向きは `server → serial_transcriber / backends → 各バックエンド → transcription` の一方向とする。
 `server.py` は faster-whisper や NeMo を直接 import しない。
+
+`/stream` の依存の向きは `server → stream_api → stream_session → backchannel_pool / backchannel_policy /
+ack_generator / stream_audio_decoder / pcm_audio / serial_transcriber` とする。
+`stream_messages.py`（メッセージの型）は `stream_api.py` と `stream_session.py` から使い、業務ロジックに依存しない。
+`maai_backchannel.py` は `backchannel_policy.py` の `BackchannelPredictor` を実装する側で、
+`server.py` の lifespan が予測器を作る関数を `backchannel_pool.py` に渡す。`stream_session.py` と
+`backchannel_pool.py` は MaAI を直接 import しない。MaAI は extras `stream` にあり、入っていない
+環境でも `/transcribe` と、相槌なしの `/stream` が動くようにするため。
 
 ## 2. 外部仕様
 
@@ -52,6 +84,24 @@ uvicorn（STT_WORKERS 個のワーカープロセス）
 
 `STT_WORKERS` / `STT_MAX_REQUESTS` / `STT_MAX_REQUESTS_JITTER` が 0 以上の整数でない場合、
 または `STT_WORKERS` が 0 の場合は、`scripts/run_server.sh` がエラーを出して起動しない。
+
+`/stream` 用（いずれも 1 ワーカーあたりの値）：
+
+| 変数 | デフォルト | 説明 |
+|---|---|---|
+| `STT_BACKCHANNEL_MAX_SESSIONS` | `4` | 同時に相槌を予測できる発話の数。超えた発話は相槌なしで受け付ける。1 以上の整数 |
+| `STT_STREAM_MAX_UTTERANCE_SECONDS` | `60` | 1 発話の音声の上限（秒）。正の数 |
+| `STT_BACKCHANNEL_THRESHOLD` | `0.5` | 相槌を出す確率のしきい値。0 より大きく 1 以下 |
+| `STT_BACKCHANNEL_MIN_INTERVAL_MS` | `1500` | 相槌を出してから、次の相槌を出せるまでの最短の間隔（ミリ秒）。0 以上の整数 |
+| `STT_BACKCHANNEL_PHRASES` | `うん,うんうん,はい,なるほど` | 相槌の文言の候補（カンマ区切り）。1 つ以上 |
+| `STT_ACK_OLLAMA_URL` | `http://127.0.0.1:11434` | 一時的な返事を作る Ollama の URL |
+| `STT_ACK_MODEL` | `gemma4:e2b` | 一時的な返事を作る Ollama のモデル |
+| `STT_ACK_TIMEOUT_MS` | `1500` | Ollama の応答を待つ上限（ミリ秒）。正の整数 |
+| `STT_ACK_MAX_CHARS` | `20` | 一時的な返事の文字数の上限。正の整数 |
+| `STT_ACK_FALLBACK_TEXT` | `ちょっと確認するね。` | LLM の返事が使えないときに返す文言。空にはできない |
+| `STT_ACK_KEEP_ALIVE` | `30m` | Ollama にモデルを GPU に置いたままにさせる時間（Ollama の `keep_alive` の書式） |
+
+範囲外の値、または数値として読めない値の場合は、起動時に `ValueError` で停止する。
 
 Haas-ja は常に GPU（`cuda`）・bfloat16 で動かす。haas-asr が使う flash-linear-attention が
 Triton と CUDA を必要とし、公表されている精度と速度も bfloat16 で測られているため。
@@ -111,6 +161,115 @@ Triton と CUDA を必要とし、公表されている精度と速度も bfloat
 haas で extras が入っていない場合、理由は
 `` STT_BACKEND=haas requires the 'haas' extra: run `uv sync --extra haas` `` になる。
 
+### 2.4 WebSocket /stream
+
+音声をストリーミングで受け取り、相槌（`backchannel`）・文字起こし結果（`transcript`）・
+一時的な返事（`ack`）をイベントとして返す。1 つの接続で、複数の発話を順に扱える。
+
+#### 接続と認証
+
+- `Authorization: Bearer <token>` ヘッダが必須。検証は `/transcribe` と同じ（`STT_API_KEY` が
+  空のときはヘッダの有無だけを見る）。
+- ヘッダが無い、またはトークンが一致しない場合は、WebSocket を確立せず HTTP `403` で拒否する。
+- 同時接続数に上限は設けない。相槌の予測ができないとき（下記）も接続は受け付け、
+  その発話を相槌なしで扱う。`transcript` と `ack` はいつもどおり送る。
+  - 同時に相槌を予測している発話が `STT_BACKCHANNEL_MAX_SESSIONS` に達している（`busy`）。
+    相槌の予測は 1 発話あたり CPU を約 1.4 コア使い続け、増やしすぎると全員の相槌が遅れるため。
+  - extras `stream` が入っていない、または予測モデルを読み込めない（`unavailable`）。
+- 相槌なしかどうかは、発話ごとに `started` の `backchannel` で知らせる。
+
+#### クライアントから送るメッセージ
+
+| 種類 | 形式 | 内容 |
+|---|---|---|
+| 発話の開始 | テキスト（JSON） | `{"type": "start", "encoding": "opus", "language": "ja"}`。`encoding` と `language` は省略可（省略時は `opus` と `STT_LANGUAGE`） |
+| 音声 | バイナリ | `encoding` に従う（下表） |
+| 発話の終了 | テキスト（JSON） | `{"type": "end"}` |
+
+音声の `encoding`：
+
+| `encoding` | 1 メッセージの中身 | 補足 |
+|---|---|---|
+| `opus` | Opus のパケット 1 つ（コンテナなしの生パケット） | モノラル。フレーム長（2.5〜60ms）とビットレートは自由。エンコード時のサンプリングレートは問わない（デコーダは常に 48kHz で復元し、16kHz に変換する） |
+| `pcm_s16le` | 16kHz・モノラル・符号付き 16bit リトルエンディアンの PCM | 長さは自由。バイト数は偶数 |
+
+- 車載など回線の細いクライアントのため、`opus` を既定にする。音声 1 秒あたりのデータ量は、
+  24kbps の Opus で約 3KB、`pcm_s16le` で 32KB。
+- Opus のパケットは送った順にデコードする。パケットを抜かすと、その直後の音声が乱れる。
+
+- 音声は `start` から `end` までの間だけ受け付ける。
+- `end` を送った後、その発話の結果を待たずに次の `start` を送ってよい。
+- 言語は `ja` のみ対応する。相槌の予測モデルが日本語用のため。
+
+#### サーバが送るイベント（テキスト・JSON）
+
+すべてのイベントに `type` と、発話の通し番号 `utterance_id`（接続ごとに 1 から）を付ける。
+`error` のうち特定の発話に結び付かないものは `utterance_id` が `null` になる。
+
+| `type` | 送るとき | フィールド |
+|---|---|---|
+| `started` | `start` を受け付けたとき | `utterance_id`、`backchannel`（この発話で相槌を出すか。bool）、`backchannel_unavailable_reason`（`backchannel` が `false` のとき `"busy"` \| `"unavailable"`、それ以外は `null`） |
+| `backchannel` | 発話中、相槌を打つべきと予測したとき | `utterance_id`、`text`（相槌の文言）、`offset_ms`（発話の先頭からの音声上の位置。int）、`probability`（予測した確率） |
+| `transcript` | `end` の後、文字起こしが終わったとき | `utterance_id`、`text`、`language`、`duration`、`latency_ms`、`backend`、`model`（各フィールドの意味は `/transcribe` の応答と同じ） |
+| `ack` | `transcript` の後、一時的な返事ができたとき | `utterance_id`、`text`、`source`（`"llm"` \| `"fallback"`）、`latency_ms`（`transcript` を送ってから `ack` を送るまで） |
+| `error` | 下表のとき | `utterance_id`、`code`、`detail` |
+
+- 1 つの発話について、`transcript` は必ず `ack` より先に送る。一時的な返事は文字起こしの結果から
+  作るため。
+- 文字起こしの結果が空（無音など）の場合、`ack` は送らない。
+- 音声を 1 つも送らずに `end` を送った発話は、文字起こしせずに `text` が空・`duration` が 0 の
+  `transcript` を返す。
+- `backchannel` は `start` から `end` までの音声に対してだけ送る。`end` の後に予測が
+  届いても送らない。発話の区切りをクライアントが決めるため、クライアントが読み上げている
+  間（発話中でない間）に相槌は出ない。
+
+`error` の `code`：
+
+| `code` | 条件 | 接続 |
+|---|---|---|
+| `invalid_message` | JSON として読めない、`type` や `encoding` が不明 | 継続 |
+| `invalid_audio` | Opus のパケットをデコードできない、`pcm_s16le` で奇数バイト | 継続（そのメッセージの音声は捨てる） |
+| `invalid_state` | 発話中に `start`、発話中でないときに音声または `end` | 継続 |
+| `unsupported_language` | `ja` 以外の言語 | 継続（その発話は始まらない） |
+| `utterance_too_long` | 1 発話の音声が `STT_STREAM_MAX_UTTERANCE_SECONDS` を超えた | 継続（その発話は破棄し、`end` まで音声を捨てる） |
+| `transcribe_failed` | 文字起こしに失敗（`detail` は `/transcribe` の `500` と同じ） | 継続（その発話の `ack` は送らない） |
+
+一時的な返事を LLM で作れなかった場合は `error` にせず、`source: "fallback"` の `ack` を送る。
+
+#### 相槌の決め方
+
+- 予測モデルは 100ms ごとに「今、相槌を打つべき確率」を出す。
+- 確率が `STT_BACKCHANNEL_THRESHOLD` を下から上へ超えたフレームで 1 回だけ相槌を出す
+  （超えている間に何度も出さない）。
+- 前の相槌から `STT_BACKCHANNEL_MIN_INTERVAL_MS` 経っていなければ出さない。
+  `offset_ms`（音声上の時刻）で測る。
+- 文言は `STT_BACKCHANNEL_PHRASES` を順に使う。同じ文言が続かないようにするため。
+
+#### 一時的な返事の作り方
+
+Ollama の `/api/chat` に、次のシステムプロンプトと会話例を付けて文字起こし結果を渡す。
+「アシスタント」として指示すると小型の LLM は質問に答えようとし、事実でない内容を言い切るため、
+答えを知らない「聞き手」として相槌を打たせる。
+
+システムプロンプト：
+
+> あなたは会話の聞き手です。相手の話を聞いて、相槌を一言だけ打ちます。あなたは答えを知らないので、質問や依頼には答えず「調べるね」「確認するね」のように受け止めるだけにします。相手の言葉を少しだけ繰り返してもよいです。15文字以内、くだけた口調、1文だけ。
+
+会話例（ユーザー → 返事）：
+
+| ユーザー | 返事 |
+|---|---|
+| 今日のニュースで何か大きいのあった？ | ニュースね、ちょっと見てみるね。 |
+| 昨日ずっと雨でさ、出かけられなかったんだよね | そっかあ、雨だったんだ。 |
+| この関数どこで呼ばれてるんだっけ | 呼び出し元ね、探してみる。 |
+| お疲れさま、今日はもういいよ | うん、お疲れさま！ |
+
+- 推論の設定：思考モードを使わない（`think: false`）、`temperature` 0.3、出力の上限 40 トークン。
+- 出力は前後の空白と引用符（`「」"'`）を取り除き、最初の 1 行だけを使う。
+- 次の場合は `STT_ACK_FALLBACK_TEXT` を `source: "fallback"` で返す。
+  - `STT_ACK_TIMEOUT_MS` 以内に応答が無い、接続できない、応答が読めない
+  - 整形後の文字数が 0、または `STT_ACK_MAX_CHARS` を超える
+
 ## 3. 処理の流れ
 
 1. ワーカーの起動時（lifespan）に、設定されたバックエンドのモデルを読み込む。
@@ -163,12 +322,68 @@ VAD（発話区間検出）を有効にし、しきい値は 0.3 とする（既
 Haas-ja の出力は「、」はある程度付くが「。」はほとんど付かない。フィラー（「えー」など）の
 扱いは実音声で確認していない。
 
+### 3.3 /stream
+
+1. 接続時に認証を確認する。
+2. `start` を受けたら、発話の音声バッファを用意し、`backchannel_pool.py` から予測器を借りて
+   状態を初期化し、`started` を返す。
+   - 予測器は発話の間だけ借り、`end` または切断で返す。接続したまま話していないクライアントが
+     枠を握り続けないため。
+   - 状態を初期化するのは、前の発話の文脈を次の発話の予測に持ち越さないため。
+   - 予測器はモデルの読み込みに約 0.6 秒かかるため、作った予測器は捨てずに使い回す。
+     初めて借りられたときに作る。
+   - 借りられなければ、その発話は相槌なしで進める。
+3. 音声を受けるたびに、`stream_audio_decoder.py` で 16kHz モノラルの波形にし、バッファへ足し、予測器へ渡す。
+   - Opus は PyAV（ffmpeg の libopus）でパケットごとにデコードする。デコーダは前のパケットの
+     状態を使うため、発話ごとに作り直す。1 パケット（20ms）のデコードは 0.1ms 未満で、
+     遅延にはほぼ影響しない。
+   - 予測器（MaAI `vap_bc_jp`）は、100ms（1,600 サンプル）ごとに 1 回推論する。受け取った音声を
+     この長さに切って `Maai.process()` を直接呼ぶ。`Maai.start()` の内部スレッドは使わない。
+     発話ごとに予測器を貸し借りするため、内部スレッドの停止と再開を管理せずに済むようにする。
+   - 予測器（MaAI `vap_bc_jp`）は、ユーザとシステムの 2 チャネルの入力を必要とする。
+     ゲートウェイはシステム側（クライアントの読み上げ）の音声を持たないため、システム側には
+     ユーザの音声と同じ長さの無音を渡す。
+   - 予測器は別スレッドで推論し、結果をイベントループへ渡す。推論中も音声の受信を止めない。
+   - 相槌を出すかどうかは `backchannel_policy.py` が決める（2.4 の「相槌の決め方」）。
+4. `end` を受けたら、その発話の予測器への入力を止め、バッファを WAV の一時ファイルに書き出して
+   `SerialTranscriber` で文字起こしする。`/transcribe` と同じ順番待ちに入るため、GPU 上の推論が
+   重ならない。一時ファイルは成否にかかわらず削除する。
+5. `transcript` を送った後、文字起こし結果から一時的な返事を作り、`ack` を送る。
+   文字起こしと一時的な返事の作成は、次の発話の受信と並行して進める。
+6. 切断されたら、予測器を返し、送り終えていないイベントは捨てる。
+
+- ワーカーの起動時（lifespan）に、Ollama へ一時的な返事を 1 回作らせて、モデルを GPU に
+  読み込ませておく。最初の `ack` がモデルの読み込みを待たないようにするため。失敗してもログに
+  出すだけで、起動は続ける。
+- 予測器は CPU だけで動く。発話中は 1 つあたり CPU 約 1.4 コアを使い、100ms ごとの推論の遅れは
+  中央値 57ms・95% 値 96ms（RTX 5060 Ti のホスト、合成音声での測定）。
+- 最初に使うときに、予測モデルの重みを Hugging Face Hub から（`~/.cache/huggingface`）、
+  音声を特徴量に変える CPC エンコーダを Libri-light の配布元 `dl.fbaipublicfiles.com` から
+  （`~/.cache/cpc`）ダウンロードしてキャッシュする。
+- `/stream` の接続は `STT_MAX_REQUESTS` の件数に数えない（uvicorn は WebSocket の接続を数えない）。
+  ワーカーの入れ替えでワーカーが終了するとき、接続中の `/stream` はクローズコード `1012` で
+  切断される。クライアントは接続し直す。
+
 ## 4. 依存関係
 
 | 区分 | 内容 |
 |---|---|
-| 必須 | fastapi、uvicorn、pydantic、python-multipart、python-dotenv、faster-whisper、av、numpy、nvidia-cublas-cu12（Linux） |
+| 必須 | fastapi、uvicorn、pydantic、python-multipart、python-dotenv、faster-whisper、av、numpy、websockets、httpx、nvidia-cublas-cu12（Linux） |
 | extras `haas` | haas-asr（GitHub のコミット固定）、torch 2.14.0。Python 3.11 以上かつ Linux のみ |
+| extras `stream` | maai。`/stream` で相槌を出す場合だけ必要 |
+| 外部サービス | Ollama（一時的な返事を作る LLM）。`/stream` を使う場合だけ必要 |
+
+- **MaAI のモデル**：相槌の予測には `maai-kyoto/vap_bc_jp`（MIT）だけを使う。話者交代の予測
+  （`vap_jp`）と発話区間の検出（`vad_jp`）は非商用ライセンス（CC BY-NC-ND 4.0）のため使わない。
+- **websockets**：uvicorn が WebSocket を扱うために必須の依存に入れる。extras `stream` が無くても
+  `/stream` で文字起こしと一時的な返事を使えるようにするため。Opus のデコードは必須の av で行う。
+- **httpx**：Ollama を非同期に呼ぶため。イベントループを止めずに、ほかの接続の音声を受け続ける。
+- **maai の依存**：maai は GUI やマイク入力用の PyQt5・pygame・pyaudio と、transformers==5.5.3 を
+  必須にしている。相槌の予測ではどれも使わないが、extras `stream` に入れると一緒に入る。
+  transformers は `override-dependencies` の下限（5.10.0 以上）が優先される。
+- **`uv sync` は extras を指定し直す**：`uv sync` は指定しなかった extras のパッケージを削除する。
+  haas と stream を両方使う環境では `uv sync --extra haas --extra stream` とする。
+  `scripts/run_server.sh` の `uv run` は余分なパッケージを削除しないため、入れた extras は残る。
 
 - **nvidia-cublas-cu12**：CTranslate2 は実行時に CUDA 12 の `libcublas.so.12` を読み込む。
   CUDA 13 だけのホストにはこれが無く、最初の推論で `CUBLAS_STATUS_NOT_SUPPORTED` になる。
@@ -192,6 +407,10 @@ Haas-ja の出力は「、」はある程度付くが「。」はほとんど付
 FastAPI の `HTTPBearer` で `Authorization` ヘッダを必須にし、`STT_API_KEY` と一致するかを
 検証する。`STT_API_KEY` が空のときはヘッダの有無だけを検証する。
 
+`/stream` も同じ `Authorization` ヘッダで同じ検証をする。`HTTPBearer` は WebSocket に使えないため、
+ヘッダの解釈とトークンの比較は `/transcribe` と共通の関数にまとめ、両方から呼ぶ。
+トークンは URL のクエリでは受け取らない。アクセスログやプロキシのログに残るため。
+
 ## 6. テスト
 
 モデルはダミーに差し替え、GPU とモデル本体なしで実行する。`SerialTranscriber` は、
@@ -199,3 +418,16 @@ FastAPI の `HTTPBearer` で `Authorization` ヘッダを必須にし、`STT_API
 次のリクエストで再試行することを検証する。haas バックエンドは
 `haas_asr` モジュールをダミーに差し替えて、読み込み・長尺処理の呼び出し・extras 未導入時の
 エラーを検証する。カバレッジが 80% を下回るとテストが失敗する。
+
+`/stream` は、予測器と Ollama をダミーに差し替えて、MaAI・Ollama・GPU なしで実行する。
+次を検証する。
+
+- 認証の失敗
+- 予測器の上限に達したとき・extras が無いときに、相槌なしで `transcript` と `ack` が届くこと
+- メッセージの順序の誤り（発話中の `start` など）と、各 `error` の `code`
+- 1 発話で `started` → `backchannel` → `transcript` → `ack` の順にイベントが届くこと
+- 相槌の決め方（しきい値の立ち上がり、最短の間隔、文言の順番、`end` 後の予測を送らないこと）
+- 一時的な返事の整形と、タイムアウト・接続失敗・文字数超過のときの固定文言への差し替え
+- Opus パケットと PCM のデコード（実際に PyAV でエンコードした Opus を使う）と、壊れたパケットの扱い
+
+MaAI と Ollama を実際に使う確認は、自動テストとは別に手動で行う。

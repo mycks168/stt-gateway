@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stt-gateway"
-version = "0.3.0"
+version = "0.4.0"
 description = "FastAPI STT gateway powered by faster-whisper or Haas-ja"
 requires-python = ">=3.10"
 dependencies = [
@@ -22,6 +22,10 @@ dependencies = [
   "nvidia-cublas-cu12>=12.4; sys_platform == 'linux'",
   # デコード結果の波形を型付きで扱うため直接依存にする（faster-whisper 経由でも入る）。
   "numpy>=1.24",
+  # uvicorn が /stream の WebSocket を扱うために必要。
+  "websockets>=13.0",
+  # /stream の一時的な返事を作るため Ollama を非同期に呼ぶ。
+  "httpx>=0.27.0",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +35,12 @@ haas = [
   # 精度と速度を検証した版。haas-asr 側には上限が無く、新しい torch が選ばれてしまうため固定する。
   "torch==2.14.0 ; python_version >= '3.11' and sys_platform == 'linux'",
   "haas-asr @ git+https://github.com/third-intelligence/Haas-ASR.git@acc614f68769dcbfae9dba96b48439c4a66295af ; python_version >= '3.11' and sys_platform == 'linux'",
+]
+
+# /stream で相槌を出すときだけ必要。MaAI は GUI やマイク入力の依存（PyQt5・pyaudio など）も
+# 必須にしており重いため extras に分ける。
+stream = [
+  "maai>=0.2.27",
 ]
 
 [tool.setuptools]
