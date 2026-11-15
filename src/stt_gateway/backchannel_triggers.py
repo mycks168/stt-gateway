@@ -1,4 +1,4 @@
-"""フレームの予測の列から、相槌の準備と相槌を出す合図を決める（timing ごとの規則）。"""
+"""フレームの予測の列から、相槌の準備と相槌を出す合図を決める。"""
 
 from __future__ import annotations
 
@@ -13,66 +13,15 @@ from .backchannel_policy import (
     BackchannelTrigger,
 )
 
-# しきい値に対して、話の種類の判定を先に始める確率の割合。確率はしきい値に届く 1〜2 フレーム前から
-# 上がり始めるため、そこで判定を始めておけば、しきい値を超えたときに待たずに送れる。
-PREPARE_THRESHOLD_RATIO = 2 / 3
 # 予測器の確率がこれ以上のフレームを、話していないとみなす（Silero VAD の推奨の境目）。
 SILENT_PROBABILITY = 0.5
 
 
-class ProbabilityTrigger:
-    """MaAI の確率がしきい値を下から上へ超えたフレームでだけ相槌を出す（timing が maai のとき）。
-
-    しきい値を超えている間ずっと出すと、1 つの間に何度も相槌を打ってしまうため。
-    pacing が閉じている間は出さない。予測は近い位置で続けて山を作ることがあるため。
-    しきい値の PREPARE_THRESHOLD_RATIO 倍を超えたフレームでは、準備の合図を出す。
-    文言は決めない（順に回すか、話の種類で選ぶかは呼び出し側が決める）。
-    """
-
-    def __init__(self, threshold: float, pacing: BackchannelPacing) -> None:
-        """しきい値と、次の相槌を出してよいかの判定を受け取る。"""
-        self._threshold = threshold
-        self._prepare_threshold = threshold * PREPARE_THRESHOLD_RATIO
-        self._pacing = pacing
-        self._was_above_threshold = False
-        self._was_above_prepare_threshold = False
-        self._has_prepared = False
-
-    def observe(self, frame: BackchannelFrame) -> BackchannelSignal | None:
-        """フレームの予測を受け取り、準備を始めるか相槌を出すなら、その合図を返す。"""
-        is_above_threshold = frame.probability >= self._threshold
-        is_above_prepare_threshold = frame.probability >= self._prepare_threshold
-        is_rising_edge = is_above_threshold and not self._was_above_threshold
-        is_prepare_rising_edge = (
-            is_above_prepare_threshold and not self._was_above_prepare_threshold
-        )
-        self._was_above_threshold = is_above_threshold
-        self._was_above_prepare_threshold = is_above_prepare_threshold
-        if not is_above_prepare_threshold:
-            # 山が終わったら、その山で始めた準備は次の山では使わない。
-            self._has_prepared = False
-        if self._pacing.is_closed(frame.offset_ms):
-            return None
-        if is_rising_edge:
-            return self._fire(frame)
-        if is_prepare_rising_edge:
-            self._has_prepared = True
-            return BackchannelPrepare(frame)
-        return None
-
-    def _fire(self, frame: BackchannelFrame) -> BackchannelFire:
-        """相槌を出す合図を作る。準備は 1 回の相槌でだけ使う。"""
-        self._pacing.hold()
-        signal = BackchannelFire(frame, self._has_prepared)
-        self._has_prepared = False
-        return signal
-
-
 class SilenceTrigger:
-    """話していない状態が silence_ms 続いたフレームで相槌を出す（timing が silence のとき）。
+    """話していない状態が silence_ms 続いたフレームで相槌を出す。
 
     フレームの確率は「話していない確率」（Silero VAD）。話していない状態になった最初のフレームで
-    準備の合図を出し、話の種類の判定を待つ時間を無音を待つ時間に重ねる。
+    準備の合図を出し、送るかどうかの判定を待つ時間を無音を待つ時間に重ねる。
     1 つの切れ目では 1 回だけ出し、次は話し手がまた話してから出す。発話の先頭の無音
     （クライアントが話し始めの前から送る音声）では、まだ何も話していないため出さない。
     話していたフレームの長さは pacing に足す。
@@ -115,13 +64,6 @@ class SilenceTrigger:
 
 
 @dataclass(frozen=True)
-class ProbabilityTiming:
-    """MaAI の確率がしきい値を超えたところで相槌を出す。"""
-
-    threshold: float
-
-
-@dataclass(frozen=True)
 class SilenceTiming:
     """話していない状態が silence_ms 続いたところで相槌を出す。
 
@@ -132,20 +74,11 @@ class SilenceTiming:
     min_new_speech_ms: int
 
 
-BackchannelTiming = ProbabilityTiming | SilenceTiming
+def create_pacing(timing: SilenceTiming, interval: BackchannelInterval) -> BackchannelPacing:
+    """次の相槌を出してよいかの判定を作る。"""
+    return BackchannelPacing(interval, timing.min_new_speech_ms)
 
 
-def create_pacing(timing: BackchannelTiming, interval: BackchannelInterval) -> BackchannelPacing:
-    """次の相槌を出してよいかの判定を作る。
-
-    新しく話した長さは Silero VAD のフレームで測るため、timing が silence のときだけ条件にする。
-    """
-    min_new_speech_ms = timing.min_new_speech_ms if isinstance(timing, SilenceTiming) else 0
-    return BackchannelPacing(interval, min_new_speech_ms)
-
-
-def create_trigger(timing: BackchannelTiming, pacing: BackchannelPacing) -> BackchannelTrigger:
-    """タイミングの決め方に合うトリガーを作る。"""
-    if isinstance(timing, ProbabilityTiming):
-        return ProbabilityTrigger(timing.threshold, pacing)
+def create_trigger(timing: SilenceTiming, pacing: BackchannelPacing) -> BackchannelTrigger:
+    """無音が続いたところで相槌を出すトリガーを作る。"""
     return SilenceTrigger(timing.silence_ms, pacing)

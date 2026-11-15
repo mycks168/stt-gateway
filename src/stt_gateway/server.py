@@ -28,14 +28,12 @@ from pydantic import BaseModel
 from .ack_generator import AckGenerator
 from .auth import is_token_accepted
 from .backchannel_emitters import SpeechJudging
-from .backchannel_judge import BackchannelKindJudge, read_judge_token
 from .backchannel_pool import BackchannelPool
 from .backends import describe_backend, load_transcriber
 from .boundary_judge import BoundaryJudge
 from .causal_lm_boundary import load_break_probability_model
 from .config import settings
 from .formats import UnsupportedAudioFormat, resolve_suffix
-from .maai_backchannel import create_maai_predictor
 from .serial_transcriber import SerialTranscriber
 from .silero_vad_predictor import create_silero_predictor
 from .stream_api import router as stream_router
@@ -52,24 +50,11 @@ def load_configured_transcriber() -> Transcriber:
 
 
 def create_http_client() -> httpx.AsyncClient:
-    """Ollama と Kev を呼ぶ HTTP クライアントを作る。
+    """一時的な返事のために Ollama を呼ぶ HTTP クライアントを作る。
 
-    待つ上限は呼び出し側（STT_ACK_TIMEOUT_MS・Kev への 1 回ごとの上限）が決めるため、ここでは設定しない。
+    待つ上限は呼び出し側（STT_ACK_TIMEOUT_MS）が決めるため、ここでは設定しない。
     """
     return httpx.AsyncClient(timeout=None)
-
-
-def build_kind_judge(client: httpx.AsyncClient) -> BackchannelKindJudge | None:
-    """話の種類の判定（Kev）を用意する。URL が空、またはトークンを読めなければ None を返す。"""
-    judge_settings = settings.backchannel_judge
-    if not judge_settings.url:
-        return None
-    try:
-        token = read_judge_token(judge_settings.token_file)
-    except ValueError:
-        logger.exception("backchannel kind judge is disabled (url=%s)", judge_settings.url)
-        return None
-    return BackchannelKindJudge(judge_settings.url, token, client)
 
 
 def build_boundary_judge() -> BoundaryJudge | None:
@@ -77,7 +62,7 @@ def build_boundary_judge() -> BoundaryJudge | None:
 
     読み込めなくても起動は続ける。区切りを判定しないだけで、相槌は出せるため。
     """
-    model_name = settings.backchannel_boundary_model
+    model_name = settings.backchannel.boundary_model
     if not model_name:
         return None
     try:
@@ -87,34 +72,32 @@ def build_boundary_judge() -> BoundaryJudge | None:
         return None
 
 
-def build_speech_judging(
-    serial_transcriber: SerialTranscriber, client: httpx.AsyncClient
-) -> SpeechJudging | None:
-    """途中の文字起こしで相槌を判定する部品を用意する。使える判定が 1 つも無ければ None を返す。"""
-    kind_judge = build_kind_judge(client)
+def build_speech_judging(serial_transcriber: SerialTranscriber) -> SpeechJudging | None:
+    """途中の文字起こしで相槌を判定する部品を用意する。区切りを判定できなければ None を返す。"""
     boundary_judge = build_boundary_judge()
-    if kind_judge is None and boundary_judge is None:
+    if boundary_judge is None:
         return None
     return SpeechJudging(
-        serial_transcriber, settings.backchannel_judge.timeout_ms, kind_judge, boundary_judge
+        serial_transcriber, settings.backchannel.judge_timeout_ms, boundary_judge
     )
 
 
 def build_stream_dependencies(
-    serial_transcriber: SerialTranscriber, ack_generator: AckGenerator, client: httpx.AsyncClient
+    serial_transcriber: SerialTranscriber, ack_generator: AckGenerator
 ) -> StreamDependencies:
     """このワーカーの /stream 用の部品を、現在の設定から組み立てる。"""
     return StreamDependencies(
         serial_transcriber=serial_transcriber,
-        backchannel_pool=BackchannelPool(settings.backchannel.max_sessions, create_maai_predictor),
-        silence_pool=BackchannelPool(settings.backchannel.max_sessions, create_silero_predictor),
+        backchannel_pool=BackchannelPool(
+            settings.backchannel.max_sessions, create_silero_predictor
+        ),
         ack_generator=ack_generator,
         backend=describe_backend(settings),
         default_language=settings.language,
         max_utterance_seconds=settings.stream_max_utterance_seconds,
         backchannel=settings.backchannel,
         ack=settings.ack,
-        speech_judging=build_speech_judging(serial_transcriber, client),
+        speech_judging=build_speech_judging(serial_transcriber),
         recorder=None
         if settings.stream_recording_dir is None
         else UtteranceRecorder(settings.stream_recording_dir),
@@ -133,9 +116,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.serial_transcriber = serial_transcriber
     http_client = create_http_client()
     ack_generator = AckGenerator(settings.ack, http_client)
-    app.state.stream_dependencies = build_stream_dependencies(
-        serial_transcriber, ack_generator, http_client
-    )
+    app.state.stream_dependencies = build_stream_dependencies(serial_transcriber, ack_generator)
     ack_warm_up = asyncio.create_task(ack_generator.warm_up())
     try:
         await serial_transcriber.preload()

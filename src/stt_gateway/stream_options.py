@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, TypeVar
 
 from .ack_generator import AckRequest
 from .ack_prompt import DEFAULT_ACK_PROMPT, AckPrompt
 from .backchannel_interval import BackchannelInterval
-from .backchannel_policy import BackchannelKind
-from .backchannel_triggers import BackchannelTiming, ProbabilityTiming, SilenceTiming
+from .backchannel_triggers import SilenceTiming
 from .config import AckSettings, BackchannelSettings
 from .stream_messages import AckOptions, BackchannelOptions
 
@@ -18,30 +16,17 @@ _Value = TypeVar("_Value", int, float)
 
 
 @dataclass(frozen=True)
-class RotationPhrasing:
-    """文言を順に回す。"""
-
-    phrases: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class KindPhrasing:
-    """話の種類を判定し、その種類の文言を順に使う。対応の無い種類では相槌を出さない。"""
-
-    phrases_by_kind: Mapping[BackchannelKind, tuple[str, ...]]
-
-
-@dataclass(frozen=True)
 class BackchannelRule:
     """1 つの発話で相槌を出す規則。
 
     boundary_threshold は、相槌を送る言い終わりの区切りらしさの下限。0 なら区切りを判定しない。
+    phrases は順に回す相槌の文言。
     """
 
-    timing: BackchannelTiming
+    timing: SilenceTiming
     interval: BackchannelInterval
     boundary_threshold: float
-    phrasing: RotationPhrasing | KindPhrasing
+    phrases: tuple[str, ...]
 
 
 def resolve_backchannel_rule(
@@ -51,12 +36,15 @@ def resolve_backchannel_rule(
     if options is None:
         options = BackchannelOptions()
     return BackchannelRule(
-        timing=_resolve_timing(options, defaults),
+        timing=SilenceTiming(
+            _given_or_default(options.silence_ms, defaults.silence_ms),
+            _given_or_default(options.min_new_speech_ms, defaults.min_new_speech_ms),
+        ),
         interval=_resolve_interval(options, defaults),
         boundary_threshold=_given_or_default(
             options.boundary_threshold, defaults.boundary_threshold
         ),
-        phrasing=_resolve_phrasing(options, defaults),
+        phrases=defaults.phrases if options.phrases is None else tuple(options.phrases),
     )
 
 
@@ -77,36 +65,6 @@ def _resolve_interval(
 def _given_or_default(given: _Value | None, default: _Value) -> _Value:
     """指定された値があればそれを、無ければサーバの設定の値を返す。"""
     return default if given is None else given
-
-
-def _resolve_timing(
-    options: BackchannelOptions, defaults: BackchannelSettings
-) -> BackchannelTiming:
-    """タイミングの決め方を決める。選ばなかった決め方の項目は使わない。
-
-    threshold は maai、silence_ms と min_new_speech_ms は silence の項目。
-    """
-    timing = defaults.timing if options.timing is None else options.timing
-    if timing == "silence":
-        return SilenceTiming(
-            _given_or_default(options.silence_ms, defaults.silence_ms),
-            _given_or_default(options.min_new_speech_ms, defaults.min_new_speech_ms),
-        )
-    return ProbabilityTiming(defaults.threshold if options.threshold is None else options.threshold)
-
-
-def _resolve_phrasing(
-    options: BackchannelOptions, defaults: BackchannelSettings
-) -> RotationPhrasing | KindPhrasing:
-    """種類ごとの文言が指定されていればそれを、無ければ順に回す文言を使う。"""
-    if options.phrases_by_kind is not None:
-        return KindPhrasing(
-            {
-                kind: (phrases,) if isinstance(phrases, str) else tuple(phrases)
-                for kind, phrases in options.phrases_by_kind.items()
-            }
-        )
-    return RotationPhrasing(defaults.phrases if options.phrases is None else tuple(options.phrases))
 
 
 def resolve_ack_request(

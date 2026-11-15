@@ -4,27 +4,14 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, NewType, Protocol
 
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Field,
-    StringConstraints,
-    TypeAdapter,
-    model_validator,
-)
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, TypeAdapter
 
 from .ack_generator import AckSource
 from .backchannel_interval import (
     MAX_BACKCHANNEL_INTERVAL_FACTOR,
     MIN_BACKCHANNEL_INTERVAL_FACTOR,
 )
-from .backchannel_policy import (
-    BACKCHANNEL_KINDS,
-    MIN_BACKCHANNEL_SILENCE_MS,
-    BackchannelKind,
-    BackchannelTimingName,
-    BackchannelUnavailableReason,
-)
+from .backchannel_policy import MIN_BACKCHANNEL_SILENCE_MS, BackchannelUnavailableReason
 from .stream_audio_decoder import AudioEncoding
 from .transcription import BackendName
 
@@ -55,7 +42,6 @@ MAX_BACKCHANNEL_MIN_INTERVAL_MS = 60000
 MAX_BACKCHANNEL_SILENCE_MS = 2000
 # 相槌の前に新しく話しているべき長さの上限。これ以上は、相槌がほぼ出なくなる。
 MAX_BACKCHANNEL_MIN_NEW_SPEECH_MS = 10000
-MAX_PHRASES_PER_KIND = 5
 
 
 def _text(max_length: int) -> StringConstraints:
@@ -85,13 +71,6 @@ class AckOptions(_StrictOptions):
     max_chars: Annotated[int, Field(ge=1, le=MAX_ACK_CHARS_LIMIT)] | None = None
 
 
-_BackchannelPhrase = Annotated[str, _text(MAX_BACKCHANNEL_PHRASE_CHARS)]
-# 1 つの種類に複数の文言を指定すると、同じ文言が続かないよう順に使う。
-_KindPhraseList = Annotated[
-    list[_BackchannelPhrase], Field(min_length=1, max_length=MAX_PHRASES_PER_KIND)
-]
-
-
 class BackchannelOptions(_StrictOptions):
     """発話ごとの相槌の指定。省略した項目はサーバの設定を使う。"""
 
@@ -102,8 +81,6 @@ class BackchannelOptions(_StrictOptions):
         ]
         | None
     ) = None
-    timing: BackchannelTimingName | None = None
-    threshold: Annotated[float, Field(gt=0.0, le=1.0)] | None = None
     silence_ms: (
         Annotated[int, Field(ge=MIN_BACKCHANNEL_SILENCE_MS, le=MAX_BACKCHANNEL_SILENCE_MS)] | None
     ) = None
@@ -123,20 +100,6 @@ class BackchannelOptions(_StrictOptions):
     ) = None
     max_interval_ms: Annotated[int, Field(ge=0, le=MAX_BACKCHANNEL_MIN_INTERVAL_MS)] | None = None
     boundary_threshold: Annotated[float, Field(ge=0.0, le=1.0)] | None = None
-    phrases_by_kind: (
-        Annotated[
-            dict[BackchannelKind, _BackchannelPhrase | _KindPhraseList],
-            Field(min_length=1, max_length=len(BACKCHANNEL_KINDS)),
-        ]
-        | None
-    ) = None
-
-    @model_validator(mode="after")
-    def _reject_both_phrasings(self) -> BackchannelOptions:
-        """順に回す文言と種類ごとの文言は、どちらを使うか曖昧になるため同時に指定させない。"""
-        if self.phrases is not None and self.phrases_by_kind is not None:
-            raise ValueError("specify either phrases or phrases_by_kind, not both")
-        return self
 
 
 class StartMessage(BaseModel):
@@ -173,17 +136,13 @@ class StartedEvent(BaseModel):
 
 
 class BackchannelEvent(BaseModel):
-    """相槌。kind は話の種類で選んだときの種類（順に回したときは None）。
-
-    probability は、timing が maai なら相槌を打つべき確率、silence なら話していない確率。
-    """
+    """相槌。probability は、相槌を出したフレームの話していない確率。"""
 
     type: Literal["backchannel"] = "backchannel"
     utterance_id: UtteranceId
     text: str
     offset_ms: int
     probability: float
-    kind: BackchannelKind | None = None
 
 
 class TranscriptEvent(BaseModel):

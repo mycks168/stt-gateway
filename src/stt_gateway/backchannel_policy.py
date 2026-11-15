@@ -1,54 +1,35 @@
-"""相槌の判断に使う型（話の種類・フレーム・合図）と、予測器・トリガー・文言の順番のインタフェース。"""
+"""相槌の判断に使う型（フレーム・合図・候補の結果）と、予測器・トリガー・文言の順番のインタフェース。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Protocol, get_args
+from typing import Literal, Protocol
 
 from .audio_decoding import AudioSamples
 
-# 相槌なしで発話を進める理由。busy は予測器の上限、unavailable は予測器や話の種類の判定を使えないとき。
+# 相槌なしで発話を進める理由。busy は予測器の上限、unavailable は予測器を使えないとき。
 BackchannelUnavailableReason = Literal["busy", "unavailable"]
 
-# 相槌を打つ時点で、話し手が今何をしているか。クライアントは種類ごとに相槌の文言を指定する。
-BackchannelKind = Literal[
-    "continuing",
-    "hesitating",
-    "question_or_request",
-    "sad_or_trouble",
-    "explanation",
-    "surprising",
-    "news",
-    "seeking_agreement",
-    "opinion",
-    "happy",
-    "complaint",
-    "step_by_step",
-    "thinking_aloud",
-    "wrapping_up",
-]
-BACKCHANNEL_KINDS: tuple[BackchannelKind, ...] = get_args(BackchannelKind)
-
-# 相槌のタイミングの決め方。maai は MaAI の確率、silence は Silero VAD で無音が続いたことで決める。
-BackchannelTimingName = Literal["maai", "silence"]
-BACKCHANNEL_TIMING_NAMES: tuple[BackchannelTimingName, ...] = get_args(BackchannelTimingName)
 # Silero VAD は 32ms ごとに判定するため、それより短い無音は見分けられない。
 MIN_BACKCHANNEL_SILENCE_MS = 32
 
 
 @dataclass(frozen=True)
 class BackchannelFrame:
-    """予測器が 1 フレームごとに出す結果。offset_ms は発話の先頭からの音声上の位置。"""
+    """予測器が 1 フレームごとに出す結果。
+
+    offset_ms は発話の先頭からの音声上の位置、probability は話し手が話していない確率。
+    """
 
     offset_ms: int
     probability: float
 
 
 class BackchannelPredictor(Protocol):
-    """ユーザの音声から、相槌を打つべき確率をフレームごとに予測する。
+    """ユーザの音声から、話していない確率をフレームごとに予測する。
 
     1 つの予測器を複数の発話で使い回すため、発話の開始時に reset() を呼ぶ。
-    predict() は CPU を使う重い処理で、別スレッドから呼ばれる。
+    predict() は CPU を使う処理で、別スレッドから呼ばれる。
     """
 
     def reset(self) -> None:
@@ -79,17 +60,14 @@ class PhraseRotation:
 
 @dataclass(frozen=True)
 class BackchannelPrepare:
-    """相槌を出しそうなフレーム。文言を決める準備（話の種類の判定）を先に始めてよい。"""
+    """相槌を出しそうなフレーム。送るかどうかの判定（途中の文字起こし）を先に始めてよい。"""
 
     frame: BackchannelFrame
 
 
 @dataclass(frozen=True)
 class BackchannelFire:
-    """相槌を出すと決めたフレーム。
-
-    has_prepared は、同じ山（maai）または同じ無音（silence）で直前に BackchannelPrepare を出したか。
-    """
+    """相槌を出すと決めたフレーム。has_prepared は、同じ無音で直前に BackchannelPrepare を出したか。"""
 
     frame: BackchannelFrame
     has_prepared: bool
@@ -98,9 +76,7 @@ class BackchannelFire:
 BackchannelSignal = BackchannelPrepare | BackchannelFire
 
 # 相槌の候補をどうしたか。sent 以外は送らなかった理由。
-BackchannelDecisionReason = Literal[
-    "sent", "timeout", "not_boundary", "judge_unavailable", "unmapped_kind", "closed"
-]
+BackchannelDecisionReason = Literal["sent", "timeout", "not_boundary", "judge_unavailable", "closed"]
 
 
 @dataclass(frozen=True)
@@ -115,7 +91,6 @@ class BackchannelDecision:
     reason: BackchannelDecisionReason
     text: str | None
     boundary_probability: float | None
-    kind: BackchannelKind | None
 
 
 class BackchannelTrigger(Protocol):

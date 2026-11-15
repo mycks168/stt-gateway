@@ -59,7 +59,7 @@ def test_pool_reports_unavailable_and_retries_after_failure(
         """1 回目だけ失敗する。"""
         attempts.append(1)
         if len(attempts) == 1:
-            raise RuntimeError("maai is not installed")
+            raise RuntimeError("silero-vad is not installed")
         return _NullPredictor()
 
     async def scenario() -> None:

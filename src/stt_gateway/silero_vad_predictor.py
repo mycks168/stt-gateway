@@ -89,13 +89,13 @@ def create_silero_predictor() -> SileroSilencePredictor:
         import onnxruntime
     except ImportError as error:
         raise RuntimeError(
-            "silence backchannel timing requires onnxruntime: run `uv sync --extra stream`"
+            "backchannel requires onnxruntime: run `uv sync --extra stream`"
         ) from error
     try:
         model_file = resources.files("silero_vad.data") / SILERO_MODEL_FILE
     except ModuleNotFoundError as error:
         raise RuntimeError(
-            "silence backchannel timing requires the 'stream' extra (silero-vad): "
+            "backchannel requires the 'stream' extra (silero-vad): "
             "run `uv sync --extra stream`"
         ) from error
     options = onnxruntime.SessionOptions()

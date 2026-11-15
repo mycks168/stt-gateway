@@ -9,8 +9,6 @@ from stt_gateway.backchannel_policy import (
     BackchannelTrigger,
 )
 from stt_gateway.backchannel_triggers import (
-    ProbabilityTiming,
-    ProbabilityTrigger,
     SilenceTiming,
     SilenceTrigger,
     create_pacing,
@@ -46,75 +44,6 @@ def _observe_frames(
         if isinstance(signal, BackchannelFire):
             pacing.settle(signal.frame.offset_ms if is_sent else None)
     return signals
-
-
-def _signals(
-    pacing: BackchannelPacing, threshold: float, probabilities: list[float]
-) -> list[BackchannelSignal]:
-    """MaAI の確率を 100ms 間隔で渡し、出た合図を返す。相槌はすべて送ったことにする。"""
-    return _observe_frames(
-        ProbabilityTrigger(threshold, pacing), pacing, probabilities, 100, is_sent=True
-    )
-
-
-def _observe_all(
-    pacing: BackchannelPacing, threshold: float, probabilities: list[float]
-) -> list[BackchannelFrame]:
-    """MaAI の確率を 100ms 間隔で渡し、相槌を出すと決めたフレームを返す。"""
-    return [
-        signal.frame
-        for signal in _signals(pacing, threshold, probabilities)
-        if isinstance(signal, BackchannelFire)
-    ]
-
-
-def test_trigger_fires_once_per_rising_edge() -> None:
-    fired = _observe_all(_fixed(0), 0.5, [0.1, 0.6, 0.7, 0.8, 0.2, 0.55])
-    assert [(f.offset_ms, f.probability) for f in fired] == [(200, 0.6), (600, 0.55)]
-
-
-def test_trigger_treats_threshold_as_above() -> None:
-    assert _observe_all(_fixed(0), 0.5, [0.5])[0].offset_ms == 100
-
-
-def test_trigger_skips_rising_edges_within_min_interval() -> None:
-    # 200ms で発火、900ms は 700ms 後なので出さない、1700ms は 1500ms 後なので出す
-    probabilities = [0.0, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.6] + [0.0] * 7 + [0.6]
-    assert [f.offset_ms for f in _observe_all(_fixed(1500), 0.5, probabilities)] == [200, 1700]
-
-
-def test_trigger_prepares_before_firing_in_same_peak() -> None:
-    # しきい値 0.6 の 2/3 は 0.4。0.45 で準備し、0.7 で準備済みとして発火する。
-    signals = _signals(_fixed(0), 0.6, [0.1, 0.45, 0.7, 0.8])
-    assert signals == [
-        BackchannelPrepare(BackchannelFrame(200, 0.45)),
-        BackchannelFire(BackchannelFrame(300, 0.7), has_prepared=True),
-    ]
-
-
-def test_trigger_fires_unprepared_when_jumping_over_both_levels() -> None:
-    signals = _signals(_fixed(0), 0.6, [0.1, 0.7])
-    assert signals == [BackchannelFire(BackchannelFrame(200, 0.7), has_prepared=False)]
-
-
-def test_trigger_does_not_reuse_preparation_from_ended_peak() -> None:
-    # 準備した山は発火せずに終わり、次の山ではいきなりしきい値を超える。
-    signals = _signals(_fixed(0), 0.6, [0.45, 0.1, 0.7])
-    assert signals[-1] == BackchannelFire(BackchannelFrame(300, 0.7), has_prepared=False)
-
-
-def test_trigger_uses_preparation_only_for_one_backchannel() -> None:
-    # 発火の後、準備の水準より上のまましきい値を下回り、また超えたときは準備し直していない。
-    signals = _signals(_fixed(0), 0.6, [0.45, 0.7, 0.5, 0.7])
-    assert signals[1:] == [
-        BackchannelFire(BackchannelFrame(200, 0.7), has_prepared=True),
-        BackchannelFire(BackchannelFrame(400, 0.7), has_prepared=False),
-    ]
-
-
-def test_trigger_does_not_prepare_within_min_interval() -> None:
-    signals = _signals(_fixed(1000), 0.6, [0.7, 0.1, 0.45, 0.7])
-    assert signals == [BackchannelFire(BackchannelFrame(100, 0.7), has_prepared=False)]
 
 
 # 32ms ごとの「話していない確率」。0.5 以上を無音とみなす。
@@ -201,14 +130,14 @@ def test_trigger_waits_until_previous_candidate_is_settled() -> None:
     )
 
 
-def test_create_trigger_matches_timing() -> None:
-    assert isinstance(create_trigger(ProbabilityTiming(0.5), _fixed(0)), ProbabilityTrigger)
-    assert isinstance(create_trigger(SilenceTiming(120, 0), _fixed(0)), SilenceTrigger)
+def test_create_trigger_uses_silence_ms() -> None:
+    pacing = _fixed(0)
+    trigger = create_trigger(SilenceTiming(64, 0), pacing)
+    signals = _observe_frames(trigger, pacing, [SPEECH, SILENT, SILENT, SILENT], 32, is_sent=True)
+    assert _fire_offsets(signals) == [96]
 
 
-def test_create_pacing_requires_new_speech_only_for_silence_timing() -> None:
+def test_create_pacing_requires_new_speech() -> None:
     interval = BackchannelInterval(0, 0, 1.0, 0)
     assert create_pacing(SilenceTiming(120, 1000), interval).is_closed(500), "まだ話していない"
-    assert not create_pacing(ProbabilityTiming(0.5), interval).is_closed(500), (
-        "maai では話した長さを測れないため条件にしない"
-    )
+    assert not create_pacing(SilenceTiming(120, 0), interval).is_closed(500)

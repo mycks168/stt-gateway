@@ -11,8 +11,7 @@ WebSocket（`/stream`）で音声をストリーミングで送ると、話し�
 - [uv](https://docs.astral.sh/uv/)
 - GPU を使う場合: NVIDIA ドライバ
 - Haas-ja を使う場合: Linux と NVIDIA GPU（CPU では動かない）。ディスクは追加で約 8GB 必要
-- `/stream` を使う場合: [Ollama](https://ollama.com/)（一時的な返事を作る）。相槌を出すには、
-  同時に話している 1 人あたり CPU 約 1.4 コア
+- `/stream` を使う場合: [Ollama](https://ollama.com/)（一時的な返事を作る）
 
 ## セットアップ
 ```bash
@@ -51,18 +50,17 @@ ollama pull gemma4:e2b
 | `STT_MAX_REQUESTS` | `0` | 1 ワーカーがこの件数を処理したら、ワーカーを起動し直す。`0` で無効 |
 | `STT_MAX_REQUESTS_JITTER` | `0` | 起動し直すまでの件数を、ワーカーごとに 0〜この値だけずらす |
 | `STT_STREAM_MAX_UTTERANCE_SECONDS` | `60` | `/stream` の 1 発話の音声の上限（秒） |
-| `STT_STREAM_RECORDING_DIR` | (空) | 指定すると、相槌を予測した `/stream` の発話ごとに、音声（`.wav`）と相槌の確率（`.json`）をこのディレクトリに保存する。空なら保存しない。保存したファイルは自動では消えない |
+| `STT_STREAM_RECORDING_DIR` | (空) | 指定すると、相槌を出した `/stream` の発話ごとに、音声（`.wav`）と相槌の判定の記録（`.json`）をこのディレクトリに保存する。空なら保存しない。保存したファイルは自動では消えない |
 | `STT_BACKCHANNEL_MAX_SESSIONS` | `4` | 1 ワーカーで同時に相槌を出せる発話の数。超えた発話は相槌なしになる |
-| `STT_BACKCHANNEL_TIMING` | `maai` | 相槌のタイミングの決め方（`maai` / `silence`）。`start` で発話ごとに変えられる |
-| `STT_BACKCHANNEL_THRESHOLD` | `0.5` | 相槌を出す確率のしきい値（0 より大きく 1 以下）。小さいほど相槌が増える |
-| `STT_BACKCHANNEL_SILENCE_MS` | `90` | `timing` が `silence` のとき、相槌を出すまでに待つ無音の長さ（ミリ秒、32 以上） |
-| `STT_BACKCHANNEL_MIN_NEW_SPEECH_MS` | `1000` | `timing` が `silence` のとき、前の相槌（無ければ話し始め）から新しくこの長さ（ミリ秒）話すまで相槌を出さない |
+| `STT_BACKCHANNEL_SILENCE_MS` | `90` | 相槌を出すまでに待つ無音の長さ（ミリ秒、32 以上） |
+| `STT_BACKCHANNEL_MIN_NEW_SPEECH_MS` | `1000` | 前の相槌（無ければ話し始め）から新しくこの長さ（ミリ秒）話すまで相槌を出さない |
 | `STT_BACKCHANNEL_MIN_INTERVAL_MS` | `1500` | 話し始めの、相槌と相槌の最短の間隔（ミリ秒） |
 | `STT_BACKCHANNEL_INTERVAL_PER_MINUTE_MS` | `3000` | 1 分話すごとに最短の間隔へ足す長さ（ミリ秒） |
 | `STT_BACKCHANNEL_INTERVAL_FACTOR` | `1.1` | 相槌を 1 回出すごとに最短の間隔を何倍にするか（1.0〜3.0） |
 | `STT_BACKCHANNEL_MAX_INTERVAL_MS` | `8000` | 伸ばした最短の間隔の上限（ミリ秒） |
 | `STT_BACKCHANNEL_BOUNDARY_MODEL` | (空) | 言いかけの途中で相槌を出さないために使う言語モデル（Hugging Face のモデル名か、モデルのディレクトリ）。空なら判定しない。extras `haas` が必要 |
 | `STT_BACKCHANNEL_BOUNDARY_THRESHOLD` | `0.35` | 相槌を出す「言い終わりの区切りらしさ」の下限（0〜1）。大きいほど相槌が減る。`0` で判定しない |
+| `STT_BACKCHANNEL_JUDGE_TIMEOUT_MS` | `200` | 区切りの判定（途中の文字起こしを含む）を待つ上限（ミリ秒）。間に合わなければ、その相槌は出さない |
 | `STT_BACKCHANNEL_PHRASES` | `うん,うんうん,はい,なるほど` | 相槌の文言（カンマ区切り）。順に使う |
 | `STT_ACK_OLLAMA_URL` | `http://127.0.0.1:11434` | 一時的な返事を作る Ollama の URL |
 | `STT_ACK_MODEL` | `gemma4:e2b` | 一時的な返事を作る Ollama のモデル |
@@ -87,7 +85,6 @@ ollama pull gemma4:e2b
 - `/stream` 用の設定が範囲外の値だと、サーバは起動しない。
 - 一時的な返事のモデルは GPU メモリを使う（`gemma4:e2b` で約 1.7GB）。Ollama が動いていなくても
   `/stream` は使え、一時的な返事は `STT_ACK_FALLBACK_TEXT` になる。
-- 相槌のモデルは、最初に相槌を出すときにダウンロードされる（`~/.cache/huggingface` と `~/.cache/cpc`）。
 
 ## 起動
 ```bash
@@ -104,50 +101,21 @@ sudo journalctl -u stt-gateway -f
 `stt-gateway.service` は配置先を `/opt/stt-gateway` として定義している。別の場所に置く
 場合は `WorkingDirectory` と `EnvironmentFile` を書き換える。
 
-### Kev による種類別の相槌
-
-`phrases_by_kind` を使う場合は、Kev-0.8B を別プロセスで常駐させる。
-Kev のソースと `serve` 依存を含む Python 環境は `/opt/stt-gateway/.kev-runtime` に置く。
-このディレクトリは Git 管理の対象外。起動時に依存の更新は行わない。
-
-`kev.service` はユーザー systemd 用で、`127.0.0.1:8009` だけで待ち受ける。
-Bearer トークンは `~/.config/kev/api_key` に保存し、ファイルの権限を `600` にする。
-systemd の `LoadCredential` で起動時に読み込むため、ユニットファイルにトークンは書かない。
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp kev.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now kev
-journalctl --user -u kev -f
-```
-
-ログインしていないときも動かすには、ユーザーの linger を有効にする
-（`loginctl show-user "$USER" -p Linger` で確認、`loginctl enable-linger "$USER"` で有効化）。
-`.env` に次を設定して gateway を再起動する。
-gateway の実行ユーザーが異なる場合も同じキーを読めるよう、パスは絶対パスにする。
-
-```dotenv
-STT_BACKCHANNEL_JUDGE_URL=http://127.0.0.1:8009
-STT_BACKCHANNEL_JUDGE_TOKEN_FILE=/home/yuki/.config/kev/api_key
-STT_BACKCHANNEL_JUDGE_TIMEOUT_MS=200
-```
+### 言いかけの途中で相槌を出さない
 
 言いかけの途中で相槌を出さないようにするには、`.env` に言語モデルを設定して gateway を再起動する
-（`uv sync --extra haas` が必要。GPU を約 1.5GB 使う）。モデルは、gateway の実行ユーザーが
+（`uv sync --extra haas --extra stream` が必要。GPU を約 1.5GB 使う）。モデルは、gateway の実行ユーザーが
 読める場所を指定する。Hugging Face のモデル名を指定すると、最初の起動でダウンロードする。
 
 ```dotenv
 STT_BACKCHANNEL_BOUNDARY_MODEL=Qwen/Qwen3.5-0.8B-Base
 ```
 
-
 ```bash
 sudo systemctl restart stt-gateway
 ```
 
-途中の文字起こしと Kev の判定が合計 200ms 以内に終わらない場合、その相槌は出さない。
-Kev への接続に失敗した場合も出さない。
+設定すると、相槌の数はおおむね半分以下に減る。
 
 ## API
 
@@ -251,7 +219,7 @@ curl -X POST http://127.0.0.1:23000/transcribe \
    ],
    "fallback_text": "えっと、ちょっと待ってね。"
  },
- "backchannel": {"phrases": ["はい", "ええ"], "threshold": 0.4, "min_interval_ms": 1200}}
+ "backchannel": {"phrases": ["うん", "うんうん"], "silence_ms": 120, "min_interval_ms": 1200}}
 ```
 
 | フィールド | 範囲 | 省略時 |
@@ -261,21 +229,17 @@ curl -X POST http://127.0.0.1:23000/transcribe \
 | `ack.fallback_text` | 1〜50 文字 | `STT_ACK_FALLBACK_TEXT` |
 | `ack.max_chars` | 1〜100 | `STT_ACK_MAX_CHARS` |
 | `backchannel.phrases` | 1〜20 文字の文言、1〜10 個 | `STT_BACKCHANNEL_PHRASES` |
-| `backchannel.timing` | `maai` / `silence` | `STT_BACKCHANNEL_TIMING` |
-| `backchannel.threshold` | 0 より大きく 1 以下（`timing` が `maai` のときだけ使う） | `STT_BACKCHANNEL_THRESHOLD` |
-| `backchannel.silence_ms` | 32〜2,000（`timing` が `silence` のときだけ使う） | `STT_BACKCHANNEL_SILENCE_MS` |
-| `backchannel.min_new_speech_ms` | 0〜10,000（`timing` が `silence` のときだけ使う） | `STT_BACKCHANNEL_MIN_NEW_SPEECH_MS` |
+| `backchannel.silence_ms` | 32〜2,000 | `STT_BACKCHANNEL_SILENCE_MS` |
+| `backchannel.min_new_speech_ms` | 0〜10,000 | `STT_BACKCHANNEL_MIN_NEW_SPEECH_MS` |
 | `backchannel.min_interval_ms` | 0〜60,000 | `STT_BACKCHANNEL_MIN_INTERVAL_MS` |
 | `backchannel.interval_per_minute_ms` | 0〜60,000 | `STT_BACKCHANNEL_INTERVAL_PER_MINUTE_MS` |
 | `backchannel.interval_factor` | 1.0〜3.0 | `STT_BACKCHANNEL_INTERVAL_FACTOR` |
 | `backchannel.max_interval_ms` | 0〜60,000 | `STT_BACKCHANNEL_MAX_INTERVAL_MS` |
 | `backchannel.boundary_threshold` | 0〜1 | `STT_BACKCHANNEL_BOUNDARY_THRESHOLD` |
 
-- `backchannel.timing` は相槌を打つタイミングの決め方。`maai` は相槌の予測モデル（MaAI）の確率が
-  `threshold` を超えたところ、`silence` は話していない状態（Silero VAD で判定）が `silence_ms`
-  続いたところで相槌を出す。`silence` では、話し始める前の無音では相槌を出さず、1 つの切れ目では
-  1 回だけ出す。`backchannel` イベントの `probability` は、`maai` では相槌を打つべき確率、
-  `silence` では話していない確率になる。
+- 相槌は、話していない状態（Silero VAD で判定）が `silence_ms` 続いたところで出す。
+  話し始める前の無音では出さず、1 つの切れ目では 1 回だけ出す。文言は `phrases` を順に使い、
+  順番は接続の中で引き継ぐ。`backchannel` イベントの `probability` は、話していない確率。
 - 相槌と相槌の間は、話し始めは `min_interval_ms` 空け、話が続くほど（1 分ごとに
   `interval_per_minute_ms` 足す）・相槌を重ねるほど（1 回ごとに `interval_factor` 倍）広げる。
   広げた間隔は `max_interval_ms` を超えない（`min_interval_ms` より小さい場合は `min_interval_ms`）。
@@ -284,8 +248,8 @@ curl -X POST http://127.0.0.1:23000/transcribe \
 - `STT_BACKCHANNEL_BOUNDARY_MODEL` を設定したサーバでは、話し手が言いかけの途中（「なので」
   「〜の方で」など）で止まったところでは相槌を出さない。途中までの文字起こしの「言い終わりの
   区切りらしさ」が `boundary_threshold` より小さいと出さない。`0` を指定した発話では判定しない。
-- `timing` が `silence` の発話では、前の相槌（無ければ話し始め）から新しく `min_new_speech_ms`
-  話すまで相槌を出さない。同じ言葉のまま間が空いただけのところで、もう一度出さないため。
+- 前の相槌（無ければ話し始め）から新しく `min_new_speech_ms` 話すまで相槌を出さない。
+  同じ言葉のまま間が空いただけのところで、もう一度出さないため。
 - `"ack": false` にすると、その発話では一時的な返事が届かない。
 - 範囲外の値や知らないフィールドがあると `invalid_message` が届き、その発話は始まらない。
 - 一時的な返事を作るモデルは、クライアントからは変えられない（`STT_ACK_MODEL`）。
@@ -293,42 +257,10 @@ curl -X POST http://127.0.0.1:23000/transcribe \
   「アシスタント」や「つなぎ役」として書くと、質問に答えて事実でない内容を言い切ったり、
   日本語以外で返したりすることがある（`gemma4:e2b` で確認）。
 
-`backchannel.phrases_by_kind` で、話の種類ごとの文言を指定できる。
-`phrases` と同時には指定できない。値は 1〜20 文字の文字列か、その配列（1〜5 個）。
-配列にすると、その種類の相槌で配列の順に使う（接続の中で順番を引き継ぐ）。
-指定しない種類では相槌を出さない。
-Kev の接続先が未設定、またはトークンが読めない場合は、`started` で
-`backchannel: false` と `backchannel_unavailable_reason: "unavailable"` が返る。
-
-```json
-{"type":"start","encoding":"opus","backchannel":{"phrases_by_kind":{"continuing":"うん","seeking_agreement":"うん","opinion":"うん","sad_or_trouble":["そっか","そっかぁ"],"complaint":"そっか","explanation":"なるほど"}}}
-```
-
-| `kind` | 話の種類 |
-|---|---|
-| `continuing` | 続きを話す途中 |
-| `hesitating` | 言いよどみ |
-| `question_or_request` | 質問・依頼 |
-| `sad_or_trouble` | 悲しい話・困った話 |
-| `explanation` | 理由・原因・解決方法の説明 |
-| `surprising` | 驚く話 |
-| `news` | 出来事の報告 |
-| `seeking_agreement` | 同意を求めている（「〜だよね」） |
-| `opinion` | 意見・感想（「〜と思う」） |
-| `happy` | 嬉しい話・楽しい話 |
-| `complaint` | 愚痴・不満 |
-| `step_by_step` | 順番に説明している途中 |
-| `thinking_aloud` | 考えながら話している・迷っている |
-| `wrapping_up` | 話をまとめて終えようとしている（「以上です」など） |
-
-種類を指定した発話の `backchannel` イベントには、判定した `kind` も付く。
-種類は途中までの文字起こしのうち、最後の文を使って判定する。
-`opinion` には「なるほど」より「うん」が合うことが多い（「〜な気がするな」もここに入る）。
-起動スクリプトを使うと、種類別相槌の送信・見送り理由が INFO ログに残る。
-`reason=sent` は送信、`not_boundary` は言いかけの途中、`unmapped_kind` は文言の指定がない種類、
-`timeout` は時間切れ、`judge_unavailable` は判定結果なし、`closed` は発話終了後を表す。
-音声位置・種類・区切りらしさ（`boundary`）・判定の所要時間も記録し、発話本文とトークンは記録しない。
-
+区切りの判定を使ったサーバでは、相槌の候補ごとの送信・見送りが INFO ログに残る（起動スクリプトを使う場合）。
+`reason=sent` は送信、`not_boundary` は言いかけの途中、`timeout` は時間切れ、
+`judge_unavailable` は途中の文字起こしが得られなかった、`closed` は発話終了後を表す。
+音声位置・区切りらしさ（`boundary`）・判定の所要時間も記録し、発話本文は記録しない。
 
 #### サーバから届くもの（テキスト・JSON）
 | `type` | 届くとき | 主なフィールド |

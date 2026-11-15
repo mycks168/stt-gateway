@@ -13,11 +13,7 @@ from pathlib import Path
 from .audio_decoding import AudioSamples
 from .backchannel_interval import BackchannelInterval
 from .backchannel_policy import BackchannelDecision, BackchannelFire, BackchannelFrame
-from .backchannel_triggers import (
-    PREPARE_THRESHOLD_RATIO,
-    BackchannelTiming,
-    ProbabilityTiming,
-)
+from .backchannel_triggers import SilenceTiming
 from .pcm_audio import write_wav
 from .stream_audio_decoder import STREAM_SAMPLE_RATE_HZ
 from .stream_messages import UtteranceId
@@ -32,10 +28,7 @@ RECORDING_FILE_MODE = 0o600
 
 @dataclass(frozen=True)
 class BackchannelTrace:
-    """1 つの発話で予測した確率と、相槌の準備・発火の合図、途中の文字起こしで判定した候補の結果。
-
-    確率は、timing が maai なら相槌を打つべき確率、silence なら話していない確率。
-    """
+    """1 つの発話で予測した話していない確率と、相槌の準備・発火の合図、判定した候補の結果。"""
 
     frames: tuple[BackchannelFrame, ...]
     prepares: tuple[BackchannelFrame, ...]
@@ -50,7 +43,7 @@ class UtteranceRecording:
     utterance_id: UtteranceId
     recorded_at: datetime
     samples: AudioSamples
-    timing: BackchannelTiming
+    timing: SilenceTiming
     interval: BackchannelInterval
     boundary_threshold: float
     trace: BackchannelTrace
@@ -64,7 +57,8 @@ def recording_document(recording: UtteranceRecording) -> dict[str, object]:
         "recorded_at": recording.recorded_at.isoformat(),
         "sample_rate_hz": STREAM_SAMPLE_RATE_HZ,
         "duration_ms": len(recording.samples) * MILLISECONDS_PER_SECOND // STREAM_SAMPLE_RATE_HZ,
-        **_timing_document(recording.timing),
+        "silence_ms": recording.timing.silence_ms,
+        "min_new_speech_ms": recording.timing.min_new_speech_ms,
         "min_interval_ms": recording.interval.min_interval_ms,
         "interval_per_minute_ms": recording.interval.per_minute_ms,
         "interval_factor": recording.interval.factor,
@@ -77,21 +71,6 @@ def recording_document(recording: UtteranceRecording) -> dict[str, object]:
             for fire in trace.fires
         ],
         "decisions": [dataclasses.asdict(decision) for decision in trace.decisions],
-    }
-
-
-def _timing_document(timing: BackchannelTiming) -> dict[str, object]:
-    """タイミングの決め方と、その項目を JSON の値にする。"""
-    if isinstance(timing, ProbabilityTiming):
-        return {
-            "timing": "maai",
-            "threshold": timing.threshold,
-            "prepare_threshold": timing.threshold * PREPARE_THRESHOLD_RATIO,
-        }
-    return {
-        "timing": "silence",
-        "silence_ms": timing.silence_ms,
-        "min_new_speech_ms": timing.min_new_speech_ms,
     }
 
 

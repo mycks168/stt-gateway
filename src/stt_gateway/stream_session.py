@@ -20,20 +20,14 @@ from .backchannel_emitters import (
     JudgedUtterance,
     JudgingEmitter,
     JudgingRule,
-    PhraseSource,
     RotationEmitter,
     SpeechJudging,
 )
 from .backchannel_interval import BackchannelPacing
-from .backchannel_policy import BackchannelKind, PhraseRotation
-from .backchannel_pool import BackchannelPool, LeasedPredictor, PredictorRefusal
+from .backchannel_policy import PhraseRotation
+from .backchannel_pool import BackchannelPool, LeasedPredictor
 from .backchannel_stream import BackchannelStream, recent_samples
-from .backchannel_triggers import (
-    BackchannelTiming,
-    ProbabilityTiming,
-    create_pacing,
-    create_trigger,
-)
+from .backchannel_triggers import create_pacing, create_trigger
 from .backends import BackendDescription
 from .config import AckSettings, BackchannelSettings
 from .sample_transcription import transcribe_samples
@@ -58,8 +52,6 @@ from .stream_messages import (
 )
 from .stream_options import (
     BackchannelRule,
-    KindPhrasing,
-    RotationPhrasing,
     resolve_ack_request,
     resolve_backchannel_rule,
 )
@@ -68,12 +60,12 @@ from .utterance_recording import UtteranceRecorder, UtteranceRecording
 
 logger = logging.getLogger(__name__)
 
-# 相槌の予測モデルが日本語用のため、/stream は日本語だけを受け付ける。
+# 相槌の文言と区切りの判定を日本語の話し言葉で調整しているため、/stream は日本語だけを受け付ける。
 SUPPORTED_LANGUAGES: tuple[str, ...] = ("ja",)
 MILLISECONDS_PER_SECOND = 1000
 # 相槌の判定では、途中の文字起こしを直近のこの長さだけにする。発話の頭から文字起こしすると
-# 長い話ほど判定が遅れて時間切れになるため。Kev に渡すのは最後の文だけで、ARGOS の録音では
-# 直近 15 秒で 25 件中 22 件が頭からと同じ種類になった（10 秒は 15 件、8 秒は 9 件）。
+# 長い話ほど判定が遅れて時間切れになるため。区切りの判定が見るのは文字起こしの末尾で、
+# 前の文脈は数文あれば足りる。
 PARTIAL_TRANSCRIPTION_WINDOW_MS = 15_000
 
 
@@ -83,7 +75,6 @@ class StreamDependencies:
 
     serial_transcriber: SerialTranscriber
     backchannel_pool: BackchannelPool
-    silence_pool: BackchannelPool
     ack_generator: AckGenerator
     backend: BackendDescription
     default_language: str
@@ -153,7 +144,6 @@ class StreamSession:
         self._sender = sender
         self._rotation_phrases = dependencies.backchannel.phrases
         self._rotation = PhraseRotation(self._rotation_phrases)
-        self._kind_rotations: dict[BackchannelKind, tuple[tuple[str, ...], PhraseRotation]] = {}
         self._current: _ReceivingUtterance | _DiscardingUtterance | None = None
         self._last_utterance_id = 0
         self._background_tasks: set[asyncio.Task[object]] = set()
@@ -240,12 +230,15 @@ class StreamSession:
             datetime.now().astimezone(),
         )
         pacing = create_pacing(rule.timing, rule.interval)
-        emitter = self._emitter_for(utterance, rule, pacing)
-        pool = self._pool_for(rule.timing)
-        lease = PredictorRefusal("unavailable") if emitter is None else await pool.acquire()
-        if isinstance(lease, LeasedPredictor) and emitter is not None:
+        pool = self._dependencies.backchannel_pool
+        lease = await pool.acquire()
+        if isinstance(lease, LeasedPredictor):
             stream = BackchannelStream(
-                utterance_id, lease.predictor, create_trigger(rule.timing, pacing), pool, emitter
+                utterance_id,
+                lease.predictor,
+                create_trigger(rule.timing, pacing),
+                pool,
+                self._emitter_for(utterance, rule, pacing),
             )
             utterance.backchannel = _BackchannelRun(stream, rule)
         self._current = utterance
@@ -259,35 +252,21 @@ class StreamSession:
             )
         )
 
-    def _pool_for(self, timing: BackchannelTiming) -> BackchannelPool:
-        """タイミングの決め方に合う予測器の貸し出し元を返す。"""
-        if isinstance(timing, ProbabilityTiming):
-            return self._dependencies.backchannel_pool
-        return self._dependencies.silence_pool
-
     def _emitter_for(
         self, utterance: _ReceivingUtterance, rule: BackchannelRule, pacing: BackchannelPacing
-    ) -> BackchannelEmitter | None:
-        """途中の文字起こしで判定するか、文言を順に回すだけかに応じた emitter を作る。
+    ) -> BackchannelEmitter:
+        """言い終わりの区切りを判定して送るか、文言を順に回すだけかに応じた emitter を作る。
 
-        判定するのは、文言を話の種類で選ぶときと、言い終わりの区切りを判定するとき。
-        話の種類で選ぶ指定なのに判定を使えないときは None を返す。
+        区切りの判定を使えない、または区切りを判定しない指定（boundary_threshold が 0）なら回すだけにする。
         """
         judging = self._dependencies.speech_judging
-        phrasing = rule.phrasing
+        rotation = self._rotation_for(rule.phrases)
         delivery = BackchannelDelivery(self._sender, pacing)
-        if isinstance(phrasing, RotationPhrasing):
-            rotation = self._rotation_for(phrasing.phrases)
-            if judging is None or judging.boundary_judge is None or rule.boundary_threshold <= 0:
-                return RotationEmitter(utterance.utterance_id, rotation, delivery)
-            phrases: PhraseSource = rotation
-        elif judging is None or judging.kind_judge is None:
-            return None
-        else:
-            phrases = self._kind_rotations_for(phrasing)
+        if judging is None or rule.boundary_threshold <= 0:
+            return RotationEmitter(utterance.utterance_id, rotation, delivery)
         return JudgingEmitter(
             JudgedUtterance(utterance.utterance_id, utterance.language, utterance.samples_until),
-            JudgingRule(phrases, rule.boundary_threshold),
+            JudgingRule(rotation, rule.boundary_threshold),
             judging,
             delivery,
             self._track,
@@ -299,17 +278,6 @@ class StreamSession:
             self._rotation_phrases = phrases
             self._rotation = PhraseRotation(phrases)
         return self._rotation
-
-    def _kind_rotations_for(self, phrasing: KindPhrasing) -> dict[BackchannelKind, PhraseRotation]:
-        """種類ごとの文言の順番を返す。前の発話と文言が同じ種類は、順番を引き継ぐ。"""
-        rotations: dict[BackchannelKind, PhraseRotation] = {}
-        for kind, phrases in phrasing.phrases_by_kind.items():
-            previous = self._kind_rotations.get(kind)
-            if previous is None or previous[0] != phrases:
-                previous = (phrases, PhraseRotation(phrases))
-                self._kind_rotations[kind] = previous
-            rotations[kind] = previous[1]
-        return rotations
 
     async def _end_utterance(self, message: EndMessage) -> None:
         """発話を終え、文字起こしと一時的な返事をバックグラウンドで作る。"""

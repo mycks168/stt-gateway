@@ -5,19 +5,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
 from .audio_decoding import AudioSamples
 from .backchannel_interval import BackchannelPacing
-from .backchannel_judge import BackchannelKindJudge
 from .backchannel_policy import (
     BackchannelDecision,
     BackchannelDecisionReason,
     BackchannelFire,
     BackchannelFrame,
-    BackchannelKind,
     BackchannelPrepare,
     PhraseRotation,
 )
@@ -32,8 +30,6 @@ MILLISECONDS_PER_SECOND = 1000
 IsOpen = Callable[[], bool]
 TrackTask = Callable[["asyncio.Task[object]"], None]
 SamplesUntil = Callable[[int], AudioSamples]
-# 文言を順に回すか、話の種類ごとの文言から選ぶか。
-PhraseSource = PhraseRotation | Mapping[BackchannelKind, PhraseRotation]
 
 
 class BackchannelDelivery:
@@ -121,14 +117,12 @@ class RotationEmitter:
 class SpeechJudging:
     """途中の文字起こしから相槌を判定するのに使う、ワーカー内で共有する部品。
 
-    kind_judge は話の種類の判定（Kev）、boundary_judge は言い終わりの区切りの判定。
-    使えないものは None。
+    timeout_ms は、途中の文字起こしと区切りの判定を待つ上限。
     """
 
     serial_transcriber: SerialTranscriber
     timeout_ms: int
-    kind_judge: BackchannelKindJudge | None
-    boundary_judge: BoundaryJudge | None
+    boundary_judge: BoundaryJudge
 
 
 @dataclass(frozen=True)
@@ -142,12 +136,12 @@ class JudgedUtterance:
 
 @dataclass(frozen=True)
 class JudgingRule:
-    """判定の結果から、相槌を送るかどうかと文言を決める規則。
+    """判定の結果から、相槌を送るかどうかを決める規則と、送るときの文言の順番。
 
-    boundary_threshold は、相槌を送る区切りらしさの下限。0 なら区切りを判定しない。
+    boundary_threshold は、相槌を送る区切りらしさの下限。
     """
 
-    phrases: PhraseSource
+    rotation: PhraseRotation
     boundary_threshold: float
 
 
@@ -157,19 +151,17 @@ class _SpeechJudgment:
 
     text: str
     boundary_probability: float | None
-    kind: BackchannelKind | None
 
 
 _Judging = asyncio.Task[_SpeechJudgment | None]
 
 
 class JudgingEmitter:
-    """フレームまでの音声を文字起こしして判定し、送るかどうかと文言を決める。
+    """フレームまでの音声を文字起こしして区切りらしさを判定し、送るかどうかを決める。
 
     言い終わりの区切りらしさが boundary_threshold に届かなければ送らない（言いかけの途中のため）。
-    文言を話の種類ごとに選ぶ指定なら、種類も判定してその種類の文言を送る。
     判定は別のタスクで行い、予測の処理を待たせない。timeout_ms に間に合わなければ出さない。
-    遅れた相槌は話の続きにかぶるため。準備の合図を受けたら判定を先に始め、同じ山で相槌を出すときは
+    遅れた相槌は話の続きにかぶるため。準備の合図を受けたら判定を先に始め、同じ無音で相槌を出すときは
     その結果を使う。判定（途中の文字起こしとモデル）の時間だけ相槌が遅れるのを避けるため。
     """
 
@@ -196,7 +188,7 @@ class JudgingEmitter:
         self._prepared = self._start_judging(signal.frame)
 
     async def emit(self, signal: BackchannelFire, is_open: IsOpen) -> None:
-        """判定のタスクを始めてすぐに戻る。同じ山で始めた判定があれば、それを使う。"""
+        """判定のタスクを始めてすぐに戻る。同じ無音で始めた判定があれば、それを使う。"""
         judging = self._prepared if signal.has_prepared else None
         self._prepared = None
         if judging is None:
@@ -229,17 +221,17 @@ class JudgingEmitter:
         """判定を待って相槌を送るかどうかを決め、送るなら送って、結果を記録する。"""
         started = time.perf_counter()
         frame = signal.frame
-        decision, rotation = await self._decide(frame, judging, is_open)
-        if rotation is None:
+        decision = await self._decide(frame, judging, is_open)
+        if decision.reason != "sent":
             self._delivery.skip()
         else:
+            # 送らない候補で文言の順番を進めないよう、次の文言は送ると決まってから取る。
             await self._delivery.deliver(
                 BackchannelEvent(
                     utterance_id=self._target.utterance_id,
-                    text=rotation.next_phrase(),
+                    text=self._rule.rotation.next_phrase(),
                     offset_ms=frame.offset_ms,
                     probability=frame.probability,
-                    kind=decision.kind,
                 )
             )
         self._decisions.append(decision)
@@ -247,30 +239,21 @@ class JudgingEmitter:
 
     async def _decide(
         self, frame: BackchannelFrame, judging: _Judging, is_open: IsOpen
-    ) -> tuple[BackchannelDecision, PhraseRotation | None]:
-        """判定を待ち、候補の結果と、送るならその文言の順番を返す。
-
-        送らない相槌で文言の順番を進めないよう、次の文言は送る側が取る。
-        """
+    ) -> BackchannelDecision:
+        """判定を待ち、候補を送るかどうかの結果を返す。"""
         try:
             judgment = await asyncio.wait_for(
                 asyncio.shield(judging), self._judging.timeout_ms / MILLISECONDS_PER_SECOND
             )
         except asyncio.TimeoutError:
-            return _decision(frame, "timeout", None), None
+            return _decision(frame, "timeout", None)
         if judgment is None:
-            return _decision(frame, "judge_unavailable", None), None
+            return _decision(frame, "judge_unavailable", None)
         if self._is_before_boundary(judgment):
-            return _decision(frame, "not_boundary", judgment), None
-        rotation = self._rotation_for(judgment.kind)
-        if rotation is None:
-            reason: BackchannelDecisionReason = (
-                "judge_unavailable" if judgment.kind is None else "unmapped_kind"
-            )
-            return _decision(frame, reason, judgment), None
+            return _decision(frame, "not_boundary", judgment)
         if not is_open():
-            return _decision(frame, "closed", judgment), None
-        return _decision(frame, "sent", judgment), rotation
+            return _decision(frame, "closed", judgment)
+        return _decision(frame, "sent", judgment)
 
     def _is_before_boundary(self, judgment: _SpeechJudgment) -> bool:
         """言い終わりの区切りに届いていない（言いかけの途中）かを返す。
@@ -279,13 +262,6 @@ class JudgingEmitter:
         """
         probability = judgment.boundary_probability
         return probability is not None and probability < self._rule.boundary_threshold
-
-    def _rotation_for(self, kind: BackchannelKind | None) -> PhraseRotation | None:
-        """送る文言の順番を返す。種類ごとに選ぶ指定で、種類が無い・対応が無いときは None。"""
-        phrases = self._rule.phrases
-        if isinstance(phrases, PhraseRotation):
-            return phrases
-        return None if kind is None else phrases.get(kind)
 
     def _log_decision(
         self, decision: BackchannelDecision, started: float, *, has_prepared: bool
@@ -296,11 +272,10 @@ class JudgingEmitter:
         """
         boundary = decision.boundary_probability
         logger.info(
-            "backchannel decision (utterance_id=%d, offset_ms=%d, kind=%s, boundary=%s, "
+            "backchannel decision (utterance_id=%d, offset_ms=%d, boundary=%s, "
             "reason=%s, prepared=%s, elapsed_ms=%.1f)",
             self._target.utterance_id,
             decision.offset_ms,
-            decision.kind,
             None if boundary is None else f"{boundary:.2f}",
             decision.reason,
             has_prepared,
@@ -308,7 +283,7 @@ class JudgingEmitter:
         )
 
     async def _judge(self, samples: AudioSamples) -> _SpeechJudgment | None:
-        """途中の音声を文字起こしし、区切りらしさと話の種類を判定する。失敗したら None を返す。"""
+        """途中の音声を文字起こしし、区切りらしさを判定する。文字起こしに失敗したら None を返す。"""
         try:
             transcription = await transcribe_samples(
                 self._judging.serial_transcriber, samples, self._target.language
@@ -322,24 +297,7 @@ class JudgingEmitter:
         text = transcription.text
         if not text:
             return None
-        boundary_probability, kind = await asyncio.gather(
-            self._judge_boundary(text), self._judge_kind(text)
-        )
-        return _SpeechJudgment(text, boundary_probability, kind)
-
-    async def _judge_boundary(self, text: str) -> float | None:
-        """区切りらしさを返す。区切りを判定しない指定・判定を使えないときは None。"""
-        judge = self._judging.boundary_judge
-        if judge is None or self._rule.boundary_threshold <= 0:
-            return None
-        return await judge.judge(text)
-
-    async def _judge_kind(self, text: str) -> BackchannelKind | None:
-        """話の種類を返す。文言を順に回す指定・判定を使えないときは None。"""
-        judge = self._judging.kind_judge
-        if judge is None or isinstance(self._rule.phrases, PhraseRotation):
-            return None
-        return await judge.judge(text)
+        return _SpeechJudgment(text, await self._judging.boundary_judge.judge(text))
 
 
 def _decision(
@@ -347,7 +305,7 @@ def _decision(
 ) -> BackchannelDecision:
     """フレームの候補の結果を作る。"""
     if judgment is None:
-        return BackchannelDecision(frame.offset_ms, reason, None, None, None)
+        return BackchannelDecision(frame.offset_ms, reason, None, None)
     return BackchannelDecision(
-        frame.offset_ms, reason, judgment.text, judgment.boundary_probability, judgment.kind
+        frame.offset_ms, reason, judgment.text, judgment.boundary_probability
     )

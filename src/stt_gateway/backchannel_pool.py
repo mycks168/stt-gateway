@@ -34,8 +34,9 @@ PredictorLease = LeasedPredictor | PredictorRefusal
 class BackchannelPool:
     """予測器を最大 max_sessions 個まで作り、使い回す。
 
-    予測器は 1 つあたり CPU を約 1.4 コア使い続けるため、上限を超えて貸すと全員の相槌が遅れる。
-    作るのにモデルの読み込みで約 0.6 秒かかるため、返された予測器は捨てずに次の発話で使う。
+    相槌を出す発話はそれぞれ、無音のたびに途中の文字起こしと区切りの判定を GPU で順番に待つ。
+    同時に相槌を出す発話を増やしすぎると、その待ちが重なって全員の相槌が間に合わなくなるため上限を設ける。
+    返された予測器は、モデルを読み込み直さないよう捨てずに次の発話で使う。
     """
 
     def __init__(self, max_sessions: int, create_predictor: PredictorFactory) -> None:

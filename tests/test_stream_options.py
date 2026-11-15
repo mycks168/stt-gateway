@@ -6,7 +6,7 @@ from pydantic import ValidationError
 from stt_gateway.ack_generator import AckRequest
 from stt_gateway.ack_prompt import DEFAULT_ACK_PROMPT, AckPrompt
 from stt_gateway.backchannel_interval import BackchannelInterval
-from stt_gateway.backchannel_triggers import ProbabilityTiming, SilenceTiming
+from stt_gateway.backchannel_triggers import SilenceTiming
 from stt_gateway.config import AckSettings, BackchannelSettings
 from stt_gateway.stream_messages import (
     CLIENT_MESSAGE_ADAPTER,
@@ -17,8 +17,6 @@ from stt_gateway.stream_messages import (
 )
 from stt_gateway.stream_options import (
     BackchannelRule,
-    KindPhrasing,
-    RotationPhrasing,
     resolve_ack_request,
     resolve_backchannel_rule,
 )
@@ -27,9 +25,9 @@ _ACK_DEFAULTS = AckSettings(
     "http://ollama.test", "gemma4:e2b", 1500, 20, "ちょっと確認するね。", "30m"
 )
 _BACKCHANNEL_DEFAULTS = BackchannelSettings(
-    4, "maai", 0.5, 120, 1000, 1500, 3000, 1.1, 8000, 0.35, ("うん", "はい")
+    4, 120, 1000, 1500, 3000, 1.1, 8000, "", 0.35, 200, ("うん", "はい")
 )
-_DEFAULT_TIMING = ProbabilityTiming(0.5)
+_DEFAULT_TIMING = SilenceTiming(120, 1000)
 _DEFAULT_INTERVAL = BackchannelInterval(1500, 3000, 1.1, 8000)
 # 会話例の上限（8 個）を 1 つ超える数
 _NINE_EXAMPLES = ",".join(['{"user": "a", "reply": "b"}'] * 9)
@@ -37,17 +35,17 @@ _NINE_EXAMPLES = ",".join(['{"user": "a", "reply": "b"}'] * 9)
 
 def test_backchannel_rule_defaults_to_server_settings() -> None:
     assert resolve_backchannel_rule(None, _BACKCHANNEL_DEFAULTS) == BackchannelRule(
-        _DEFAULT_TIMING, _DEFAULT_INTERVAL, 0.35, RotationPhrasing(("うん", "はい"))
+        _DEFAULT_TIMING, _DEFAULT_INTERVAL, 0.35, ("うん", "はい")
     )
     assert resolve_backchannel_rule(BackchannelOptions(), _BACKCHANNEL_DEFAULTS) == BackchannelRule(
-        _DEFAULT_TIMING, _DEFAULT_INTERVAL, 0.35, RotationPhrasing(("うん", "はい"))
+        _DEFAULT_TIMING, _DEFAULT_INTERVAL, 0.35, ("うん", "はい")
     )
 
 
 def test_backchannel_rule_uses_given_fields_only() -> None:
-    options = BackchannelOptions(threshold=0.3, phrases=["はい", "ええ"])
+    options = BackchannelOptions(silence_ms=200, phrases=["はい", "ええ"])
     assert resolve_backchannel_rule(options, _BACKCHANNEL_DEFAULTS) == BackchannelRule(
-        ProbabilityTiming(0.3), _DEFAULT_INTERVAL, 0.35, RotationPhrasing(("はい", "ええ"))
+        SilenceTiming(200, 1000), _DEFAULT_INTERVAL, 0.35, ("はい", "ええ")
     )
     assert resolve_backchannel_rule(
         BackchannelOptions(min_interval_ms=0), _BACKCHANNEL_DEFAULTS
@@ -55,7 +53,7 @@ def test_backchannel_rule_uses_given_fields_only() -> None:
         _DEFAULT_TIMING,
         BackchannelInterval(0, 3000, 1.1, 8000),
         0.35,
-        RotationPhrasing(("うん", "はい")),
+        ("うん", "はい"),
     )
     assert (
         resolve_backchannel_rule(
@@ -75,24 +73,13 @@ def test_backchannel_rule_resolves_interval_growth() -> None:
 
 
 def test_backchannel_rule_resolves_silence_timing() -> None:
-    silence = BackchannelOptions(timing="silence", threshold=0.9)
-    assert resolve_backchannel_rule(silence, _BACKCHANNEL_DEFAULTS).timing == SilenceTiming(
-        120, 1000
-    ), "silence では threshold を使わず、silence_ms と min_new_speech_ms はサーバの設定"
-    custom = BackchannelOptions(timing="silence", silence_ms=200, min_new_speech_ms=500)
+    custom = BackchannelOptions(silence_ms=200, min_new_speech_ms=500)
     assert resolve_backchannel_rule(custom, _BACKCHANNEL_DEFAULTS).timing == SilenceTiming(200, 500)
-    silence_server = BackchannelSettings(
-        4, "silence", 0.5, 150, 800, 1500, 0, 1.0, 1500, 0.35, ("うん",)
-    )
-    assert resolve_backchannel_rule(None, silence_server).timing == SilenceTiming(150, 800)
-    maai = BackchannelOptions(timing="maai", silence_ms=200)
-    assert resolve_backchannel_rule(maai, silence_server).timing == ProbabilityTiming(0.5)
 
 
 @pytest.mark.parametrize(
     "backchannel",
     [
-        {"timing": "vad"},
         {"silence_ms": 31},
         {"silence_ms": 2001},
         {"interval_factor": 0.9},
@@ -102,7 +89,6 @@ def test_backchannel_rule_resolves_silence_timing() -> None:
         {"boundary_threshold": 1.1},
     ],
     ids=[
-        "unknown-timing",
         "silence-too-short",
         "silence-too-long",
         "factor-shrinks",
@@ -155,11 +141,11 @@ def test_ack_request_allows_explicitly_empty_examples() -> None:
 def test_start_message_parses_options() -> None:
     message = CLIENT_MESSAGE_ADAPTER.validate_json(
         '{"type": "start", "ack": {"system_prompt": "  つなぎ役です。 "},'
-        ' "backchannel": {"phrases": ["はい"], "threshold": 1}}'
+        ' "backchannel": {"phrases": ["はい"], "silence_ms": 120}}'
     )
     assert isinstance(message, StartMessage)
     assert message.ack == AckOptions(system_prompt="つなぎ役です。")
-    assert message.backchannel == BackchannelOptions(phrases=["はい"], threshold=1.0)
+    assert message.backchannel == BackchannelOptions(phrases=["はい"], silence_ms=120)
     disabled = CLIENT_MESSAGE_ADAPTER.validate_json('{"type": "start", "ack": false}')
     assert isinstance(disabled, StartMessage)
     assert disabled.ack is False
@@ -176,33 +162,14 @@ def test_start_message_parses_options() -> None:
         '{"type": "start", "ack": {"examples": [{"user": "a"}]}}',
         '{"type": "start", "ack": {"max_chars": 0}}',
         '{"type": "start", "ack": {"fallback_text": "' + "あ" * 51 + '"}}',
-        '{"type": "start", "backchannel": {"threshold": 0}}',
-        '{"type": "start", "backchannel": {"threshold": 1.5}}',
         '{"type": "start", "backchannel": {"phrases": []}}',
         '{"type": "start", "backchannel": {"phrases": ["' + "あ" * 21 + '"]}}',
         '{"type": "start", "backchannel": {"min_interval_ms": 60001}}',
         '{"type": "start", "backchannel": {"volume": 0.5}}',
-        '{"type": "start", "backchannel": {"phrases_by_kind": {}}}',
-        '{"type": "start", "backchannel": {"phrases_by_kind": {"angry": "おお"}}}',
-        '{"type": "start", "backchannel": {"phrases_by_kind": {"news": ""}}}',
-        '{"type": "start", "backchannel": {"phrases_by_kind": {"news": []}}}',
-        '{"type": "start", "backchannel": {"phrases_by_kind": {"news": ["a","b","c","d","e","f"]}}}',
-        '{"type": "start", "backchannel": {"phrases_by_kind": {"news": ["うん", ""]}}}',
-        '{"type": "start", "backchannel": {"phrases": ["うん"], "phrases_by_kind": {"news": "へえ"}}}',
+        '{"type": "start", "backchannel": {"timing": "silence"}}',
+        '{"type": "start", "backchannel": {"phrases_by_kind": {"news": "へえ"}}}',
     ],
 )
 def test_start_message_rejects_invalid_options(start: str) -> None:
     with pytest.raises(ValidationError):
         CLIENT_MESSAGE_ADAPTER.validate_json(start)
-
-
-def test_backchannel_rule_uses_phrases_by_kind() -> None:
-    options = BackchannelOptions(
-        phrases_by_kind={"news": "そうなんだ", "sad_or_trouble": ["そっか", "そっかぁ"]}
-    )
-    assert resolve_backchannel_rule(options, _BACKCHANNEL_DEFAULTS) == BackchannelRule(
-        _DEFAULT_TIMING,
-        _DEFAULT_INTERVAL,
-        0.35,
-        KindPhrasing({"news": ("そうなんだ",), "sad_or_trouble": ("そっか", "そっかぁ")}),
-    )

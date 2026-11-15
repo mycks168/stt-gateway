@@ -5,10 +5,8 @@ from pathlib import Path
 import pytest
 
 from stt_gateway.config import (
-    BackchannelJudgeSettings,
     BackchannelSettings,
     load_ack_settings,
-    load_backchannel_judge_settings,
     load_backchannel_settings,
     load_max_utterance_seconds,
     load_stream_recording_dir,
@@ -31,14 +29,14 @@ def test_parse_backend_rejects_unknown_backend() -> None:
 
 _STREAM_ENV_NAMES = (
     "STT_BACKCHANNEL_MAX_SESSIONS",
-    "STT_BACKCHANNEL_TIMING",
-    "STT_BACKCHANNEL_THRESHOLD",
     "STT_BACKCHANNEL_SILENCE_MS",
     "STT_BACKCHANNEL_MIN_INTERVAL_MS",
     "STT_BACKCHANNEL_INTERVAL_PER_MINUTE_MS",
     "STT_BACKCHANNEL_INTERVAL_FACTOR",
     "STT_BACKCHANNEL_MIN_NEW_SPEECH_MS",
+    "STT_BACKCHANNEL_BOUNDARY_MODEL",
     "STT_BACKCHANNEL_BOUNDARY_THRESHOLD",
+    "STT_BACKCHANNEL_JUDGE_TIMEOUT_MS",
     "STT_BACKCHANNEL_MAX_INTERVAL_MS",
     "STT_BACKCHANNEL_PHRASES",
     "STT_ACK_OLLAMA_URL",
@@ -65,15 +63,15 @@ def test_stream_settings_defaults() -> None:
     ack = load_ack_settings()
     assert backchannel == BackchannelSettings(
         max_sessions=4,
-        timing="maai",
-        threshold=0.5,
         silence_ms=90,
         min_new_speech_ms=1000,
         min_interval_ms=1500,
         interval_per_minute_ms=3000,
         interval_factor=1.1,
         max_interval_ms=8000,
+        boundary_model="",
         boundary_threshold=0.35,
+        judge_timeout_ms=200,
         phrases=("うん", "うんうん", "はい", "なるほど"),
     )
     assert ack.ollama_url == "http://127.0.0.1:11434"
@@ -88,13 +86,14 @@ def test_stream_settings_defaults() -> None:
 def test_stream_settings_read_environment(clean_stream_env: pytest.MonkeyPatch) -> None:
     clean_stream_env.setenv("STT_BACKCHANNEL_PHRASES", " うん , ,へえ ")
     clean_stream_env.setenv("STT_ACK_OLLAMA_URL", "http://ollama:11434/")
-    clean_stream_env.setenv("STT_BACKCHANNEL_THRESHOLD", "1")
-    assert load_backchannel_settings().phrases == ("うん", "へえ")
-    assert load_backchannel_settings().threshold == 1.0
-    clean_stream_env.setenv("STT_BACKCHANNEL_TIMING", " silence ")
     clean_stream_env.setenv("STT_BACKCHANNEL_SILENCE_MS", "200")
-    assert load_backchannel_settings().timing == "silence"
-    assert load_backchannel_settings().silence_ms == 200
+    clean_stream_env.setenv("STT_BACKCHANNEL_BOUNDARY_MODEL", " /models/qwen ")
+    clean_stream_env.setenv("STT_BACKCHANNEL_JUDGE_TIMEOUT_MS", "150")
+    backchannel = load_backchannel_settings()
+    assert backchannel.phrases == ("うん", "へえ")
+    assert backchannel.silence_ms == 200
+    assert backchannel.boundary_model == "/models/qwen"
+    assert backchannel.judge_timeout_ms == 150
     assert load_ack_settings().ollama_url == "http://ollama:11434"
 
 
@@ -104,9 +103,8 @@ def test_stream_settings_read_environment(clean_stream_env: pytest.MonkeyPatch) 
         ("STT_BACKCHANNEL_MAX_SESSIONS", "0", "must be 1 or more"),
         ("STT_BACKCHANNEL_MAX_SESSIONS", "four", "must be an integer"),
         ("STT_BACKCHANNEL_MIN_INTERVAL_MS", "-1", "must be 0 or more"),
-        ("STT_BACKCHANNEL_THRESHOLD", "0", "greater than 0.0"),
-        ("STT_BACKCHANNEL_THRESHOLD", "1.5", "at most 1.0"),
-        ("STT_BACKCHANNEL_THRESHOLD", "high", "must be a number"),
+        ("STT_BACKCHANNEL_JUDGE_TIMEOUT_MS", "0", "must be 1 or more"),
+        ("STT_BACKCHANNEL_INTERVAL_FACTOR", "high", "must be a number"),
         ("STT_BACKCHANNEL_PHRASES", " , ", "at least one phrase"),
     ],
 )
@@ -142,26 +140,6 @@ def test_max_utterance_seconds_must_be_positive(clean_stream_env: pytest.MonkeyP
         load_max_utterance_seconds()
 
 
-def test_backchannel_judge_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in (
-        "STT_BACKCHANNEL_JUDGE_URL",
-        "STT_BACKCHANNEL_JUDGE_TOKEN_FILE",
-        "STT_BACKCHANNEL_JUDGE_TIMEOUT_MS",
-    ):
-        monkeypatch.delenv(name, raising=False)
-    defaults = load_backchannel_judge_settings()
-    assert defaults == BackchannelJudgeSettings("", Path("~/.config/kev/api_key"), 200)
-
-    monkeypatch.setenv("STT_BACKCHANNEL_JUDGE_URL", " http://127.0.0.1:8009/ ")
-    monkeypatch.setenv("STT_BACKCHANNEL_JUDGE_TIMEOUT_MS", "150")
-    assert load_backchannel_judge_settings().url == "http://127.0.0.1:8009"
-    assert load_backchannel_judge_settings().timeout_ms == 150
-
-    monkeypatch.setenv("STT_BACKCHANNEL_JUDGE_TIMEOUT_MS", "0")
-    with pytest.raises(ValueError, match="STT_BACKCHANNEL_JUDGE_TIMEOUT_MS"):
-        load_backchannel_judge_settings()
-
-
 def test_stream_recording_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("STT_STREAM_RECORDING_DIR", raising=False)
     assert load_stream_recording_dir() is None
@@ -174,7 +152,6 @@ def test_stream_recording_dir(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize(
     ("name", "value"),
     [
-        ("STT_BACKCHANNEL_TIMING", "vad"),
         ("STT_BACKCHANNEL_SILENCE_MS", "31"),
         ("STT_BACKCHANNEL_INTERVAL_FACTOR", "0.9"),
         ("STT_BACKCHANNEL_INTERVAL_FACTOR", "3.5"),
@@ -183,7 +160,7 @@ def test_stream_recording_dir(monkeypatch: pytest.MonkeyPatch) -> None:
         ("STT_BACKCHANNEL_BOUNDARY_THRESHOLD", "high"),
     ],
 )
-def test_backchannel_settings_reject_invalid_timing(
+def test_backchannel_settings_reject_out_of_range_values(
     clean_stream_env: pytest.MonkeyPatch, name: str, value: str
 ) -> None:
     clean_stream_env.setenv(name, value)

@@ -13,11 +13,7 @@ from .backchannel_interval import (
     MAX_BACKCHANNEL_INTERVAL_FACTOR,
     MIN_BACKCHANNEL_INTERVAL_FACTOR,
 )
-from .backchannel_policy import (
-    BACKCHANNEL_TIMING_NAMES,
-    MIN_BACKCHANNEL_SILENCE_MS,
-    BackchannelTimingName,
-)
+from .backchannel_policy import MIN_BACKCHANNEL_SILENCE_MS
 from .transcription import BackendName
 
 load_dotenv(override=False)
@@ -98,18 +94,6 @@ def _read_non_empty(name: str, default: str) -> str:
     return value
 
 
-def parse_backchannel_timing(value: str) -> BackchannelTimingName:
-    """相槌のタイミングの決め方の名前を読む。"""
-    name = value.strip()
-    for timing in BACKCHANNEL_TIMING_NAMES:
-        if name == timing:
-            return timing
-    raise ValueError(
-        f"invalid STT_BACKCHANNEL_TIMING: '{value}' "
-        f"(must be one of {', '.join(BACKCHANNEL_TIMING_NAMES)})"
-    )
-
-
 def parse_phrases(name: str, raw: str) -> tuple[str, ...]:
     """カンマ区切りの文言の一覧を読む。空の要素は捨て、1 つも無ければ ValueError にする。"""
     phrases = tuple(phrase.strip() for phrase in raw.split(",") if phrase.strip())
@@ -120,18 +104,22 @@ def parse_phrases(name: str, raw: str) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class BackchannelSettings:
-    """/stream の相槌の設定。"""
+    """/stream の相槌の設定。
+
+    boundary_model は言いかけの途中で相槌を出さないための言語モデル（空なら判定しない）、
+    judge_timeout_ms は途中の文字起こしと区切りの判定を待つ上限。
+    """
 
     max_sessions: int
-    timing: BackchannelTimingName
-    threshold: float
     silence_ms: int
     min_new_speech_ms: int
     min_interval_ms: int
     interval_per_minute_ms: int
     interval_factor: float
     max_interval_ms: int
+    boundary_model: str
     boundary_threshold: float
+    judge_timeout_ms: int
     phrases: tuple[str, ...]
 
 
@@ -147,23 +135,10 @@ class AckSettings:
     keep_alive: str
 
 
-@dataclass(frozen=True)
-class BackchannelJudgeSettings:
-    """/stream で相槌の文言を話の種類に合わせて選ぶ、Kev の設定。url が空なら使わない。"""
-
-    url: str
-    token_file: Path
-    timeout_ms: int
-
-
 def load_backchannel_settings() -> BackchannelSettings:
     """相槌の設定を環境変数から読む。"""
     return BackchannelSettings(
         max_sessions=_read_int("STT_BACKCHANNEL_MAX_SESSIONS", "4", minimum=1),
-        timing=parse_backchannel_timing(os.getenv("STT_BACKCHANNEL_TIMING", "maai")),
-        threshold=_read_float(
-            "STT_BACKCHANNEL_THRESHOLD", "0.5", lower_exclusive=0.0, upper_inclusive=1.0
-        ),
         silence_ms=_read_int(
             "STT_BACKCHANNEL_SILENCE_MS", "90", minimum=MIN_BACKCHANNEL_SILENCE_MS
         ),
@@ -174,20 +149,13 @@ def load_backchannel_settings() -> BackchannelSettings:
         ),
         interval_factor=_read_interval_factor(),
         max_interval_ms=_read_int("STT_BACKCHANNEL_MAX_INTERVAL_MS", "8000", minimum=0),
+        boundary_model=os.getenv("STT_BACKCHANNEL_BOUNDARY_MODEL", "").strip(),
         boundary_threshold=_read_boundary_threshold(),
+        judge_timeout_ms=_read_int("STT_BACKCHANNEL_JUDGE_TIMEOUT_MS", "200", minimum=1),
         phrases=parse_phrases(
             "STT_BACKCHANNEL_PHRASES",
             os.getenv("STT_BACKCHANNEL_PHRASES", DEFAULT_BACKCHANNEL_PHRASES),
         ),
-    )
-
-
-def load_backchannel_judge_settings() -> BackchannelJudgeSettings:
-    """話の種類の判定（Kev）の設定を環境変数から読む。"""
-    return BackchannelJudgeSettings(
-        url=os.getenv("STT_BACKCHANNEL_JUDGE_URL", "").strip().rstrip("/"),
-        token_file=Path(os.getenv("STT_BACKCHANNEL_JUDGE_TOKEN_FILE", "~/.config/kev/api_key")),
-        timeout_ms=_read_int("STT_BACKCHANNEL_JUDGE_TIMEOUT_MS", "200", minimum=1),
     )
 
 
@@ -234,10 +202,6 @@ class Settings:
     api_key: str = os.getenv("STT_API_KEY", "")
     stream_max_utterance_seconds: float = field(default_factory=load_max_utterance_seconds)
     backchannel: BackchannelSettings = field(default_factory=load_backchannel_settings)
-    backchannel_judge: BackchannelJudgeSettings = field(
-        default_factory=load_backchannel_judge_settings
-    )
-    backchannel_boundary_model: str = os.getenv("STT_BACKCHANNEL_BOUNDARY_MODEL", "").strip()
     ack: AckSettings = field(default_factory=load_ack_settings)
     stream_recording_dir: Path | None = field(default_factory=load_stream_recording_dir)
 

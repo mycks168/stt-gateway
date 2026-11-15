@@ -3,10 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
-import httpx
 import numpy as np
 import pytest
 
@@ -15,12 +14,10 @@ from stt_gateway.backchannel_emitters import (
     JudgedUtterance,
     JudgingEmitter,
     JudgingRule,
-    PhraseSource,
     RotationEmitter,
     SpeechJudging,
 )
 from stt_gateway.backchannel_interval import BackchannelInterval, BackchannelPacing
-from stt_gateway.backchannel_judge import BackchannelKindJudge
 from stt_gateway.backchannel_policy import (
     BackchannelDecision,
     BackchannelFire,
@@ -37,7 +34,7 @@ _EMITTER_LOGGER = "stt_gateway.backchannel_emitters"
 _FIRE = BackchannelFire(BackchannelFrame(300, 0.7), False)
 # 前の相槌から 1 秒は次を出さない。送ったかどうかを pacing の状態で確かめるため。
 _INTERVAL = BackchannelInterval(1000, 0, 1.0, 1000)
-_KIND_PHRASES: PhraseSource = {"news": PhraseRotation(("そうなんだ",))}
+_BOUNDARY_THRESHOLD = 0.35
 
 
 class _RecordingSender:
@@ -67,13 +64,12 @@ class _FixedTranscriber:
 
 @dataclass
 class _Setup:
-    """JudgingEmitter を動かす条件。boundary_probability が None なら区切りの判定を使えない。"""
+    """JudgingEmitter を動かす条件。boundary_probability が None ならモデルが失敗する。"""
 
     text: str = "先週引っ越したんだ。"
     transcription_error: Exception | None = None
-    phrases: PhraseSource = field(default_factory=lambda: _KIND_PHRASES)
-    boundary_threshold: float = 0.0
-    boundary_probability: float | None = None
+    phrases: tuple[str, ...] = ("うん", "はい")
+    boundary_probability: float | None = 0.9
     timeout_ms: int = 1000
 
 
@@ -83,7 +79,6 @@ class _Outcome:
 
     events: list[StreamEvent]
     decisions: tuple[BackchannelDecision, ...]
-    kev_request_count: int
     boundary_texts: list[str]
     is_closed_after: bool
 
@@ -97,52 +92,44 @@ async def _emit_fire(emitter: JudgingEmitter) -> None:
 
 
 def _run_emitter(setup: _Setup, scenario: EmitterScenario = _emit_fire) -> _Outcome:
-    """JudgingEmitter を scenario で動かし、結果を返す。Kev はいつも news を返す。"""
-    kev_requests: list[httpx.Request] = []
+    """JudgingEmitter を scenario で動かし、結果を返す。"""
     boundary_texts: list[str] = []
-
-    def kev(request: httpx.Request) -> httpx.Response:
-        """いつも news を返すダミーの Kev。"""
-        kev_requests.append(request)
-        return httpx.Response(200, json={"answers": {"kind": {"choice": "news"}}})
 
     def boundary_model(text: str) -> float:
         """受け取った文を記録し、決まった区切りらしさを返す。"""
         boundary_texts.append(text)
-        assert setup.boundary_probability is not None
+        if setup.boundary_probability is None:
+            raise RuntimeError("CUDA out of memory")
         return setup.boundary_probability
 
     async def run() -> _Outcome:
         sender = _RecordingSender()
         pacing = BackchannelPacing(_INTERVAL, 0)
         tasks: list[asyncio.Task[object]] = []
-        async with httpx.AsyncClient(transport=httpx.MockTransport(kev)) as client:
-            judging = SpeechJudging(
-                SerialTranscriber(lambda: _FixedTranscriber(setup.text, setup.transcription_error)),
-                setup.timeout_ms,
-                BackchannelKindJudge("http://kev.test", "secret", client),
-                None if setup.boundary_probability is None else BoundaryJudge(boundary_model),
-            )
-            emitter = JudgingEmitter(
-                JudgedUtterance(
-                    UtteranceId(1),
-                    "ja",
-                    lambda offset_ms: np.ones(offset_ms * 16, dtype=np.float32),
-                ),
-                JudgingRule(setup.phrases, setup.boundary_threshold),
-                judging,
-                BackchannelDelivery(sender, pacing),
-                tasks.append,
-            )
-            pacing.hold()
-            await scenario(emitter)
-            await emitter.wait()
-            # 準備で始めて使わなかった判定も、Kev への問い合わせが終わるまで待つ。
-            await asyncio.gather(*tasks)
+        judging = SpeechJudging(
+            SerialTranscriber(lambda: _FixedTranscriber(setup.text, setup.transcription_error)),
+            setup.timeout_ms,
+            BoundaryJudge(boundary_model),
+        )
+        emitter = JudgingEmitter(
+            JudgedUtterance(
+                UtteranceId(1),
+                "ja",
+                lambda offset_ms: np.ones(offset_ms * 16, dtype=np.float32),
+            ),
+            JudgingRule(PhraseRotation(setup.phrases), _BOUNDARY_THRESHOLD),
+            judging,
+            BackchannelDelivery(sender, pacing),
+            tasks.append,
+        )
+        pacing.hold()
+        await scenario(emitter)
+        await emitter.wait()
+        # 準備で始めて使わなかった判定も、区切りの判定が終わるまで待つ。
+        await asyncio.gather(*tasks)
         return _Outcome(
             sender.events,
             emitter.decisions(),
-            len(kev_requests),
             boundary_texts,
             pacing.is_closed(_FIRE.frame.offset_ms + 1),
         )
@@ -150,27 +137,43 @@ def _run_emitter(setup: _Setup, scenario: EmitterScenario = _emit_fire) -> _Outc
     return asyncio.run(run())
 
 
-def _sent(text: str, kind: str | None) -> list[BackchannelEvent]:
+def _sent(text: str) -> list[BackchannelEvent]:
     """_FIRE の位置で送られるはずの相槌。"""
-    return [
-        BackchannelEvent.model_validate(
-            {"utterance_id": 1, "text": text, "offset_ms": 300, "probability": 0.7, "kind": kind}
-        )
-    ]
+    return [BackchannelEvent(utterance_id=UtteranceId(1), text=text, offset_ms=300, probability=0.7)]
 
 
-def test_judging_emitter_sends_phrase_for_judged_kind(caplog: pytest.LogCaptureFixture) -> None:
+def test_judging_emitter_sends_next_phrase_at_boundary(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO, logger=_EMITTER_LOGGER)
     outcome = _run_emitter(_Setup())
-    assert outcome.events == _sent("そうなんだ", "news")
-    assert outcome.decisions == (
-        BackchannelDecision(300, "sent", "先週引っ越したんだ。", None, "news"),
-    )
+    assert outcome.events == _sent("うん")
+    assert outcome.boundary_texts == ["先週引っ越したんだ"], "末尾の句点は除いて判定する"
+    assert outcome.decisions == (BackchannelDecision(300, "sent", "先週引っ越したんだ。", 0.9),)
     assert outcome.is_closed_after, "送った相槌から間隔を数える"
     assert "reason=sent" in caplog.text
-    assert "kind=news" in caplog.text
+    assert "boundary=0.90" in caplog.text
     assert "offset_ms=300" in caplog.text
     assert "先週引っ越したんだ" not in caplog.text
+
+
+def test_judging_emitter_sends_at_threshold() -> None:
+    outcome = _run_emitter(_Setup(boundary_probability=_BOUNDARY_THRESHOLD))
+    assert outcome.events == _sent("うん"), "境目ちょうどは区切りとみなす"
+
+
+def test_judging_emitter_stays_silent_before_boundary(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger=_EMITTER_LOGGER)
+    outcome = _run_emitter(_Setup(text="あのさ、なので", boundary_probability=0.1))
+    assert outcome.events == []
+    assert outcome.decisions == (BackchannelDecision(300, "not_boundary", "あのさ、なので", 0.1),)
+    assert not outcome.is_closed_after, "送らなかった候補では間隔を数え直さない"
+    assert "reason=not_boundary" in caplog.text
+
+
+def test_judging_emitter_sends_when_boundary_model_fails(caplog: pytest.LogCaptureFixture) -> None:
+    outcome = _run_emitter(_Setup(boundary_probability=None))
+    assert outcome.events == _sent("うん"), "区切りを判定できなければ、相槌が消えないよう送る"
+    assert outcome.decisions[0].boundary_probability is None
+    assert "backchannel boundary judge failed" in caplog.text
 
 
 def test_judging_emitter_drops_backchannel_after_end(caplog: pytest.LogCaptureFixture) -> None:
@@ -184,13 +187,13 @@ def test_judging_emitter_drops_backchannel_after_end(caplog: pytest.LogCaptureFi
     assert "reason=closed" in caplog.text
 
 
-def test_judging_emitter_skips_empty_transcript_without_asking_kev(
+def test_judging_emitter_skips_empty_transcript_without_judging(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.INFO, logger=_EMITTER_LOGGER)
     outcome = _run_emitter(_Setup(text=""))
-    assert (outcome.events, outcome.kev_request_count) == ([], 0)
-    assert outcome.decisions == (BackchannelDecision(300, "judge_unavailable", None, None, None),)
+    assert (outcome.events, outcome.boundary_texts) == ([], [])
+    assert outcome.decisions == (BackchannelDecision(300, "judge_unavailable", None, None),)
     assert "reason=judge_unavailable" in caplog.text
 
 
@@ -202,50 +205,14 @@ def test_judging_emitter_skips_when_partial_transcription_fails(
     assert "partial transcription for backchannel failed" in caplog.text
 
 
-def test_judging_emitter_skips_unmapped_kind_without_counting_interval() -> None:
-    outcome = _run_emitter(_Setup(phrases={"opinion": PhraseRotation(("うん",))}))
-    assert outcome.events == []
-    assert [decision.reason for decision in outcome.decisions] == ["unmapped_kind"]
-    assert not outcome.is_closed_after, "送らなかった候補では間隔を数え直さない"
+def test_judging_emitter_does_not_advance_phrase_for_skipped_candidate() -> None:
+    async def scenario(emitter: JudgingEmitter) -> None:
+        await emitter.emit(_FIRE, lambda: False)
+        await emitter.wait()
+        await emitter.emit(_FIRE, lambda: True)
 
-
-def test_judging_emitter_stays_silent_before_boundary(caplog: pytest.LogCaptureFixture) -> None:
-    caplog.set_level(logging.INFO, logger=_EMITTER_LOGGER)
-    outcome = _run_emitter(
-        _Setup(text="あのさ、なので", boundary_threshold=0.35, boundary_probability=0.1)
-    )
-    assert outcome.events == []
-    assert outcome.boundary_texts == ["あのさ、なので"]
-    assert outcome.decisions == (
-        BackchannelDecision(300, "not_boundary", "あのさ、なので", 0.1, "news"),
-    )
-    assert not outcome.is_closed_after
-    assert "reason=not_boundary" in caplog.text
-    assert "boundary=0.10" in caplog.text
-
-
-def test_judging_emitter_sends_at_boundary() -> None:
-    outcome = _run_emitter(_Setup(boundary_threshold=0.35, boundary_probability=0.35))
-    assert outcome.events == _sent("そうなんだ", "news"), "境目ちょうどは区切りとみなす"
-    assert outcome.decisions[0].boundary_probability == 0.35
-
-
-def test_judging_emitter_does_not_judge_boundary_when_threshold_is_zero() -> None:
-    outcome = _run_emitter(_Setup(boundary_threshold=0.0, boundary_probability=0.1))
-    assert outcome.events == _sent("そうなんだ", "news")
-    assert outcome.boundary_texts == [], "区切りを判定しない指定では、モデルを動かさない"
-
-
-def test_judging_emitter_rotates_phrases_at_boundary_without_asking_kev() -> None:
-    outcome = _run_emitter(
-        _Setup(
-            phrases=PhraseRotation(("うん", "はい")),
-            boundary_threshold=0.35,
-            boundary_probability=0.9,
-        )
-    )
-    assert outcome.events == _sent("うん", None)
-    assert outcome.kev_request_count == 0, "文言を順に回す指定では、話の種類を判定しない"
+    outcome = _run_emitter(_Setup(), scenario)
+    assert outcome.events == _sent("うん"), "送らなかった候補では文言の順番を進めない"
 
 
 def test_judging_emitter_times_out(caplog: pytest.LogCaptureFixture) -> None:
@@ -257,7 +224,7 @@ def test_judging_emitter_times_out(caplog: pytest.LogCaptureFixture) -> None:
 
     outcome = _run_emitter(_Setup(timeout_ms=0), scenario)
     assert outcome.events == []
-    assert outcome.decisions == (BackchannelDecision(300, "timeout", None, None, None),)
+    assert outcome.decisions == (BackchannelDecision(300, "timeout", None, None),)
     assert "reason=timeout" in caplog.text
 
 
@@ -265,7 +232,7 @@ def _prepare_then_emit(*, has_prepared: bool) -> _Outcome:
     """準備の合図の後に相槌を出す。"""
 
     async def scenario(emitter: JudgingEmitter) -> None:
-        emitter.prepare(BackchannelPrepare(BackchannelFrame(200, 0.45)))
+        emitter.prepare(BackchannelPrepare(BackchannelFrame(200, 0.6)))
         await emitter.emit(BackchannelFire(_FIRE.frame, has_prepared), lambda: True)
 
     return _run_emitter(_Setup(), scenario)
@@ -276,14 +243,14 @@ def test_judging_emitter_uses_judgment_started_by_prepare(
 ) -> None:
     caplog.set_level(logging.INFO, logger=_EMITTER_LOGGER)
     outcome = _prepare_then_emit(has_prepared=True)
-    assert outcome.kev_request_count == 1, "準備で始めた判定を使い、判定し直さない"
-    assert outcome.events == _sent("そうなんだ", "news")
+    assert len(outcome.boundary_texts) == 1, "準備で始めた判定を使い、判定し直さない"
+    assert outcome.events == _sent("うん")
     assert "prepared=True" in caplog.text
 
 
-def test_judging_emitter_judges_again_when_preparation_is_not_for_this_peak() -> None:
+def test_judging_emitter_judges_again_when_preparation_is_not_for_this_silence() -> None:
     outcome = _prepare_then_emit(has_prepared=False)
-    assert outcome.kev_request_count == 2, "別の山の準備は使わず、相槌を出す位置で判定し直す"
+    assert len(outcome.boundary_texts) == 2, "別の無音の準備は使わず、相槌を出す位置で判定し直す"
     assert len(outcome.events) == 1
 
 
@@ -308,7 +275,7 @@ def _run_rotation_emitter(*, is_open: bool) -> tuple[list[StreamEvent], bool]:
 
 def test_rotation_emitter_sends_next_phrase() -> None:
     events, is_closed_after = _run_rotation_emitter(is_open=True)
-    assert events == _sent("うん", None)
+    assert events == _sent("うん")
     assert is_closed_after, "送った相槌から間隔を数える"
 
 
@@ -330,7 +297,7 @@ def test_delivery_reopens_pacing_when_sending_fails() -> None:
         pacing = BackchannelPacing(_INTERVAL, 0)
         pacing.hold()
         with pytest.raises(ConnectionError):
-            await BackchannelDelivery(_BrokenSender(), pacing).deliver(_sent("うん", None)[0])
+            await BackchannelDelivery(_BrokenSender(), pacing).deliver(_sent("うん")[0])
         return pacing.is_closed(_FIRE.frame.offset_ms + 1)
 
     assert not asyncio.run(run()), "送れなかった候補では間隔を数えず、次の候補を出せる"

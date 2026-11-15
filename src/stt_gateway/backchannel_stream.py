@@ -9,7 +9,6 @@ import numpy as np
 
 from .audio_decoding import AudioSamples
 from .backchannel_emitters import BackchannelEmitter
-from .backchannel_peaks import summarize_probabilities
 from .backchannel_policy import (
     BackchannelFire,
     BackchannelFrame,
@@ -30,7 +29,7 @@ MILLISECONDS_PER_SECOND = 1000
 class BackchannelStream:
     """1 つの発話の音声を予測器へ渡し、相槌を出すと決めたら emitter に渡す。
 
-    予測は CPU を使う重い処理のため別スレッドで行い、音声の受信を止めない。
+    予測は CPU を使う処理のため別スレッドで行い、音声の受信を止めない。
     予測器は発話が終わってスレッド上の処理も終わってから返す。予測中に返すと、
     次の発話が同じ予測器を同時に使ってしまうため。
     """
@@ -97,7 +96,6 @@ class BackchannelStream:
             logger.exception("backchannel prediction failed (utterance_id=%d)", self._utterance_id)
             await self._discard_until_closed()
         finally:
-            self._log_probabilities()
             self._pool.release(self._predictor)
 
     async def _next_batch(self) -> AudioSamples | None:
@@ -129,17 +127,6 @@ class BackchannelStream:
             else:
                 self._fires.append(signal)
                 await self._emitter.emit(signal, self.is_open)
-
-    def _log_probabilities(self) -> None:
-        """確率の山を残す。しきい値をクライアントの音声に合わせて調整するときの手がかりにする。"""
-        summary = summarize_probabilities(self._frames)
-        logger.info(
-            "backchannel probabilities (utterance_id=%d, frames=%d, max=%.2f, peaks=%s)",
-            self._utterance_id,
-            summary.frame_count,
-            summary.max_probability,
-            summary.format_peaks(),
-        )
 
     async def _discard_until_closed(self) -> None:
         """予測に失敗した後は、終了の印が来るまで音声を捨てる。"""
