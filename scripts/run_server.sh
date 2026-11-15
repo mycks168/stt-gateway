@@ -31,7 +31,8 @@ if [ "$WORKERS" -lt 1 ]; then
 fi
 
 # 各ワーカーはモデルを 1 つずつ読み込む。ワーカーを増やすと GPU メモリもその数だけ必要になる。
-UVICORN_ARGS=(stt_gateway.server:app --host "$HOST" --port "$PORT" --workers "$WORKERS")
+UVICORN_ARGS=(stt_gateway.server:app --host "$HOST" --port "$PORT" --workers "$WORKERS"
+  --log-config scripts/logging.json)
 # 指定件数を処理したワーカーを終了させ、肥大化したメモリを解放する。
 # ワーカーが 2 つ以上なら uvicorn が、1 つならプロセスごと終了するので systemd が起動し直す。
 if [ "$MAX_REQUESTS" -gt 0 ]; then

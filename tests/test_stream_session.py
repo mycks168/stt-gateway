@@ -105,6 +105,7 @@ def _session(
         max_utterance_seconds=60,
         backchannel=_BACKCHANNEL_SETTINGS,
         ack=_ACK_SETTINGS,
+        kind_judging=None,
     )
     return StreamSession(dependencies, sender)
 

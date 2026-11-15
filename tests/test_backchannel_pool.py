@@ -6,7 +6,11 @@ import pytest
 
 from stt_gateway.audio_decoding import AudioSamples
 from stt_gateway.backchannel_policy import BackchannelFrame
-from stt_gateway.backchannel_pool import BackchannelPool, LeasedPredictor, PredictorRefusal
+from stt_gateway.backchannel_pool import (
+    BackchannelPool,
+    LeasedPredictor,
+    PredictorRefusal,
+)
 
 
 class _NullPredictor:

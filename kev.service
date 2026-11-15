@@ -1,0 +1,15 @@
+[Unit]
+Description=Kev-0.8B backchannel kind judge
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/stt-gateway
+LoadCredential=api_key:%h/.config/kev/api_key
+ExecStart=/bin/bash /opt/stt-gateway/scripts/run_kev.sh
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target

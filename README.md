@@ -95,6 +95,42 @@ sudo journalctl -u stt-gateway -f
 `stt-gateway.service` は配置先を `/opt/stt-gateway` として定義している。別の場所に置く
 場合は `WorkingDirectory` と `EnvironmentFile` を書き換える。
 
+### Kev による種類別の相槌
+
+`phrases_by_kind` を使う場合は、Kev-0.8B を別プロセスで常駐させる。
+Kev のソースと `serve` 依存を含む Python 環境は `/opt/stt-gateway/.kev-runtime` に置く。
+このディレクトリは Git 管理の対象外。起動時に依存の更新は行わない。
+
+`kev.service` はユーザー systemd 用で、`127.0.0.1:8009` だけで待ち受ける。
+Bearer トークンは `~/.config/kev/api_key` に保存し、ファイルの権限を `600` にする。
+systemd の `LoadCredential` で起動時に読み込むため、ユニットファイルにトークンは書かない。
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp kev.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now kev
+journalctl --user -u kev -f
+```
+
+ログインしていないときも動かすには、ユーザーの linger を有効にする
+（`loginctl show-user "$USER" -p Linger` で確認、`loginctl enable-linger "$USER"` で有効化）。
+`.env` に次を設定して gateway を再起動する。
+gateway の実行ユーザーが異なる場合も同じキーを読めるよう、パスは絶対パスにする。
+
+```dotenv
+STT_BACKCHANNEL_JUDGE_URL=http://127.0.0.1:8009
+STT_BACKCHANNEL_JUDGE_TOKEN_FILE=/home/yuki/.config/kev/api_key
+STT_BACKCHANNEL_JUDGE_TIMEOUT_MS=200
+```
+
+```bash
+sudo systemctl restart stt-gateway
+```
+
+途中の文字起こしと Kev の判定が合計 200ms 以内に終わらない場合、その相槌は出さない。
+Kev への接続に失敗した場合も出さない。
+
 ## API
 
 ### GET /health
@@ -216,6 +252,43 @@ curl -X POST http://127.0.0.1:23000/transcribe \
 - プロンプトは「会話の聞き手」として書き出し、「答えを知らない」「日本語で」を入れる。
   「アシスタント」や「つなぎ役」として書くと、質問に答えて事実でない内容を言い切ったり、
   日本語以外で返したりすることがある（`gemma4:e2b` で確認）。
+
+`backchannel.phrases_by_kind` で、話の種類ごとの文言を指定できる。
+`phrases` と同時には指定できない。値は 1〜20 文字の文字列か、その配列（1〜5 個）。
+配列にすると、その種類の相槌で配列の順に使う（接続の中で順番を引き継ぐ）。
+指定しない種類では相槌を出さない。
+Kev の接続先が未設定、またはトークンが読めない場合は、`started` で
+`backchannel: false` と `backchannel_unavailable_reason: "unavailable"` が返る。
+
+```json
+{"type":"start","encoding":"opus","backchannel":{"phrases_by_kind":{"continuing":"うん","seeking_agreement":"うん","opinion":"うん","sad_or_trouble":["そっか","そっかぁ"],"complaint":"そっか","explanation":"なるほど"}}}
+```
+
+| `kind` | 話の種類 |
+|---|---|
+| `continuing` | 続きを話す途中 |
+| `hesitating` | 言いよどみ |
+| `question_or_request` | 質問・依頼 |
+| `sad_or_trouble` | 悲しい話・困った話 |
+| `explanation` | 理由・原因・解決方法の説明 |
+| `surprising` | 驚く話 |
+| `news` | 出来事の報告 |
+| `seeking_agreement` | 同意を求めている（「〜だよね」） |
+| `opinion` | 意見・感想（「〜と思う」） |
+| `happy` | 嬉しい話・楽しい話 |
+| `complaint` | 愚痴・不満 |
+| `step_by_step` | 順番に説明している途中 |
+| `thinking_aloud` | 考えながら話している・迷っている |
+| `wrapping_up` | 話をまとめて終えようとしている（「以上です」など） |
+
+種類を指定した発話の `backchannel` イベントには、判定した `kind` も付く。
+種類は途中までの文字起こしのうち、最後の文を使って判定する。
+`opinion` には「なるほど」より「うん」が合うことが多い（「〜な気がするな」もここに入る）。
+起動スクリプトを使うと、種類別相槌の送信・見送り理由が INFO ログに残る。
+`reason=sent` は送信、`unmapped_kind` は文言の指定がない種類、`timeout` は時間切れ、
+`judge_unavailable` は判定結果なし、`closed` は発話終了後を表す。
+音声位置・種類・判定の所要時間も記録し、発話本文とトークンは記録しない。
+
 
 #### サーバから届くもの（テキスト・JSON）
 | `type` | 届くとき | 主なフィールド |

@@ -2,13 +2,29 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
 from .ack_generator import AckRequest
 from .ack_prompt import DEFAULT_ACK_PROMPT, AckPrompt
+from .backchannel_policy import BackchannelKind
 from .config import AckSettings, BackchannelSettings
 from .stream_messages import AckOptions, BackchannelOptions
+
+
+@dataclass(frozen=True)
+class RotationPhrasing:
+    """文言を順に回す。"""
+
+    phrases: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class KindPhrasing:
+    """話の種類を判定し、その種類の文言を順に使う。対応の無い種類では相槌を出さない。"""
+
+    phrases_by_kind: Mapping[BackchannelKind, tuple[str, ...]]
 
 
 @dataclass(frozen=True)
@@ -17,7 +33,7 @@ class BackchannelRule:
 
     threshold: float
     min_interval_ms: int
-    phrases: tuple[str, ...]
+    phrasing: RotationPhrasing | KindPhrasing
 
 
 def resolve_backchannel_rule(
@@ -25,14 +41,30 @@ def resolve_backchannel_rule(
 ) -> BackchannelRule:
     """指定された項目はそのまま、省略された項目はサーバの設定を使う。"""
     if options is None:
-        return BackchannelRule(defaults.threshold, defaults.min_interval_ms, defaults.phrases)
+        return BackchannelRule(
+            defaults.threshold, defaults.min_interval_ms, RotationPhrasing(defaults.phrases)
+        )
     return BackchannelRule(
         threshold=defaults.threshold if options.threshold is None else options.threshold,
         min_interval_ms=(
             defaults.min_interval_ms if options.min_interval_ms is None else options.min_interval_ms
         ),
-        phrases=defaults.phrases if options.phrases is None else tuple(options.phrases),
+        phrasing=_resolve_phrasing(options, defaults),
     )
+
+
+def _resolve_phrasing(
+    options: BackchannelOptions, defaults: BackchannelSettings
+) -> RotationPhrasing | KindPhrasing:
+    """種類ごとの文言が指定されていればそれを、無ければ順に回す文言を使う。"""
+    if options.phrases_by_kind is not None:
+        return KindPhrasing(
+            {
+                kind: (phrases,) if isinstance(phrases, str) else tuple(phrases)
+                for kind, phrases in options.phrases_by_kind.items()
+            }
+        )
+    return RotationPhrasing(defaults.phrases if options.phrases is None else tuple(options.phrases))
 
 
 def resolve_ack_request(

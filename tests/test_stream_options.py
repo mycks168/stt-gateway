@@ -15,6 +15,8 @@ from stt_gateway.stream_messages import (
 )
 from stt_gateway.stream_options import (
     BackchannelRule,
+    KindPhrasing,
+    RotationPhrasing,
     resolve_ack_request,
     resolve_backchannel_rule,
 )
@@ -29,21 +31,21 @@ _NINE_EXAMPLES = ",".join(['{"user": "a", "reply": "b"}'] * 9)
 
 def test_backchannel_rule_defaults_to_server_settings() -> None:
     assert resolve_backchannel_rule(None, _BACKCHANNEL_DEFAULTS) == BackchannelRule(
-        0.5, 1500, ("うん", "はい")
+        0.5, 1500, RotationPhrasing(("うん", "はい"))
     )
     assert resolve_backchannel_rule(BackchannelOptions(), _BACKCHANNEL_DEFAULTS) == BackchannelRule(
-        0.5, 1500, ("うん", "はい")
+        0.5, 1500, RotationPhrasing(("うん", "はい"))
     )
 
 
 def test_backchannel_rule_uses_given_fields_only() -> None:
     options = BackchannelOptions(threshold=0.3, phrases=["はい", "ええ"])
     assert resolve_backchannel_rule(options, _BACKCHANNEL_DEFAULTS) == BackchannelRule(
-        0.3, 1500, ("はい", "ええ")
+        0.3, 1500, RotationPhrasing(("はい", "ええ"))
     )
     assert resolve_backchannel_rule(
         BackchannelOptions(min_interval_ms=0), _BACKCHANNEL_DEFAULTS
-    ) == BackchannelRule(0.5, 0, ("うん", "はい"))
+    ) == BackchannelRule(0.5, 0, RotationPhrasing(("うん", "はい")))
 
 
 def test_ack_request_defaults_and_disable() -> None:
@@ -111,8 +113,24 @@ def test_start_message_parses_options() -> None:
         '{"type": "start", "backchannel": {"phrases": ["' + "あ" * 21 + '"]}}',
         '{"type": "start", "backchannel": {"min_interval_ms": 60001}}',
         '{"type": "start", "backchannel": {"volume": 0.5}}',
+        '{"type": "start", "backchannel": {"phrases_by_kind": {}}}',
+        '{"type": "start", "backchannel": {"phrases_by_kind": {"angry": "おお"}}}',
+        '{"type": "start", "backchannel": {"phrases_by_kind": {"news": ""}}}',
+        '{"type": "start", "backchannel": {"phrases_by_kind": {"news": []}}}',
+        '{"type": "start", "backchannel": {"phrases_by_kind": {"news": ["a","b","c","d","e","f"]}}}',
+        '{"type": "start", "backchannel": {"phrases_by_kind": {"news": ["うん", ""]}}}',
+        '{"type": "start", "backchannel": {"phrases": ["うん"], "phrases_by_kind": {"news": "へえ"}}}',
     ],
 )
 def test_start_message_rejects_invalid_options(start: str) -> None:
     with pytest.raises(ValidationError):
         CLIENT_MESSAGE_ADAPTER.validate_json(start)
+
+
+def test_backchannel_rule_uses_phrases_by_kind() -> None:
+    options = BackchannelOptions(
+        phrases_by_kind={"news": "そうなんだ", "sad_or_trouble": ["そっか", "そっかぁ"]}
+    )
+    assert resolve_backchannel_rule(options, _BACKCHANNEL_DEFAULTS) == BackchannelRule(
+        0.5, 1500, KindPhrasing({"news": ("そうなんだ",), "sad_or_trouble": ("そっか", "そっかぁ")})
+    )

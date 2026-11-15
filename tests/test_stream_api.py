@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
+import time
 import wave
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +22,7 @@ from stream_helpers import encode_opus_packets, sine_wave
 from stt_gateway import server, stream_api
 from stt_gateway.audio_decoding import AudioSamples
 from stt_gateway.backchannel_policy import BackchannelFrame
-from stt_gateway.config import Settings
+from stt_gateway.config import BackchannelJudgeSettings, Settings
 from stt_gateway.config import settings as base_settings
 from stt_gateway.maai_backchannel import MILLISECONDS_PER_FRAME, SAMPLES_PER_FRAME
 from stt_gateway.pcm_audio import samples_to_pcm_s16le
@@ -37,6 +40,9 @@ class _RecordingTranscriber:
         self.error: Exception | None = None
         self.sample_counts: list[int] = []
         self.ollama_requests: list[dict[str, Any]] = []
+        self.kev_requests: list[httpx.Request] = []
+        self.kev_kind = "news"
+        self.kev_delay_seconds = 0.0
 
     def transcribe(self, audio_path: Path, language: str) -> Transcription:
         """WAV のフレーム数を記録する。error が設定されていれば送出する。"""
@@ -73,7 +79,15 @@ class _ScriptedPredictor:
 
 
 # ローカルの .env に依存しないよう、どのテストでも whisper バックエンド・認証無効・日本語にする。
-_TEST_SETTING_CHANGES: dict[str, Any] = {"backend": "whisper", "api_key": "", "language": "ja"}
+# 話の種類の判定（Kev）は、使うテストだけで有効にする。
+_TEST_SETTING_CHANGES: dict[str, Any] = {
+    "backend": "whisper",
+    "api_key": "",
+    "language": "ja",
+    "backchannel_judge": BackchannelJudgeSettings("", Path("/nonexistent"), 200),
+}
+_KEV_URL = "http://kev.test:8009"
+_KEV_TOKEN = "kev-token-for-tests"
 
 
 def _settings_with(**changes: Any) -> Settings:
@@ -96,15 +110,19 @@ def transcriber(monkeypatch: pytest.MonkeyPatch) -> _RecordingTranscriber:
     monkeypatch.setattr(server, "load_transcriber", lambda _settings: fake)
     monkeypatch.setattr(server, "create_maai_predictor", lambda: _ScriptedPredictor([0.1, 0.9]))
 
-    def ollama(request: httpx.Request) -> httpx.Response:
-        """ダミーの Ollama。リクエストを記録し、常に同じ返事を返す。"""
+    async def fake_services(request: httpx.Request) -> httpx.Response:
+        """ダミーの Ollama と Kev。リクエストを記録し、決まった答えを返す。"""
+        if request.url.path == "/v1/systemone":
+            fake.kev_requests.append(request)
+            await asyncio.sleep(fake.kev_delay_seconds)
+            return httpx.Response(200, json={"answers": {"kind": {"choice": fake.kev_kind}}})
         fake.ollama_requests.append(json.loads(request.content))
         return httpx.Response(200, json={"message": {"content": _ACK_TEXT}})
 
     monkeypatch.setattr(
         server,
-        "create_ack_http_client",
-        lambda: httpx.AsyncClient(transport=httpx.MockTransport(ollama)),
+        "create_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(fake_services)),
     )
     return fake
 
@@ -149,6 +167,7 @@ def test_stream_sends_backchannel_transcript_and_ack_in_order(
             "text": "うん",
             "offset_ms": 200,
             "probability": 0.9,
+            "kind": None,
         }
 
         websocket.send_json({"type": "end"})
@@ -399,3 +418,152 @@ def test_stream_rejects_invalid_options_without_starting(client: TestClient) -> 
         error = websocket.receive_json()
         assert (error["code"], error["utterance_id"]) == ("invalid_message", None)
         assert _start(websocket)["utterance_id"] == 1, "不正な指定の発話は始まらない"
+
+
+def _wait_until(condition: Callable[[], bool], timeout_seconds: float = 5.0) -> None:
+    """別スレッドで動くサーバ側の処理が condition を満たすまで待つ。"""
+    deadline = time.monotonic() + timeout_seconds
+    while not condition():
+        assert time.monotonic() < deadline, "条件を満たさないまま時間切れになった"
+        time.sleep(0.01)
+
+
+def _enable_kind_judge(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, timeout_ms: int = 1000
+) -> None:
+    """Kev のトークンを置き、話の種類の判定を有効にする。lifespan の前に呼ぶ。"""
+    token_file = tmp_path / "api_key"
+    token_file.write_text(f"{_KEV_TOKEN}\n")
+    _patch_settings(
+        monkeypatch, backchannel_judge=BackchannelJudgeSettings(_KEV_URL, token_file, timeout_ms)
+    )
+
+
+_PHRASES_BY_KIND = {"continuing": "うん", "news": "そうなんだ", "sad_or_trouble": "そっか"}
+
+
+@contextmanager
+def _kind_stream() -> Iterator[WebSocketTestSession]:
+    """lifespan を実行して接続し、種類ごとの文言を指定した PCM の発話を始める。"""
+    with (
+        TestClient(server.app) as client,
+        client.websocket_connect("/stream", headers=_AUTH_HEADERS) as websocket,
+    ):
+        _start(websocket, encoding="pcm_s16le", backchannel={"phrases_by_kind": _PHRASES_BY_KIND})
+        yield websocket
+
+
+def test_stream_picks_backchannel_phrase_by_kind(
+    transcriber: _RecordingTranscriber, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable_kind_judge(monkeypatch, tmp_path)
+    transcriber.text = "先週、引っ越ししたんだよね。"
+    with _kind_stream() as websocket:
+        websocket.send_bytes(_pcm(0.2))
+        backchannel = websocket.receive_json()
+        assert backchannel == {
+            "type": "backchannel",
+            "utterance_id": 1,
+            "text": "そうなんだ",
+            "offset_ms": 200,
+            "probability": 0.9,
+            "kind": "news",
+        }
+
+    request = transcriber.kev_requests[0]
+    assert str(request.url) == f"{_KEV_URL}/v1/systemone"
+    assert request.headers["Authorization"] == f"Bearer {_KEV_TOKEN}"
+    body = json.loads(request.content)
+    assert body["state"] == "先週、引っ越ししたんだよね。"
+    assert set(body["questions"]["kind"]["criteria"]) >= {"continuing", "hesitating", "news"}
+    assert transcriber.sample_counts[0] == 3200, "相槌のフレーム（200ms）までの音声を文字起こしする"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [("hesitating", 0.0), ("news", 0.5)],
+    ids=["unmapped-kind", "timeout"],
+)
+def test_stream_skips_backchannel_for_unmapped_kind_or_timeout(
+    transcriber: _RecordingTranscriber,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    case: tuple[str, float],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="stt_gateway.backchannel_stream")
+    kind, delay_seconds = case
+    _enable_kind_judge(monkeypatch, tmp_path, timeout_ms=50)
+    transcriber.kev_kind = kind
+    transcriber.kev_delay_seconds = delay_seconds
+    reason = "unmapped_kind" if kind == "hesitating" else "timeout"
+    with _kind_stream() as websocket:
+        websocket.send_bytes(_pcm(0.2))
+        _wait_until(lambda: bool(transcriber.kev_requests))
+        _wait_until(lambda: f"reason={reason}" in caplog.text)
+        websocket.send_json({"type": "end"})
+        assert websocket.receive_json()["type"] == "transcript", "相槌は届かない"
+        assert websocket.receive_json()["type"] == "ack"
+    assert transcriber.kev_requests, "判定は行われている"
+    assert f"reason={reason}" in caplog.text
+
+
+@pytest.mark.parametrize("has_url", [False, True], ids=["no-url", "no-token-file"])
+def test_stream_reports_unavailable_when_kind_judge_is_unusable(
+    transcriber: _RecordingTranscriber, monkeypatch: pytest.MonkeyPatch, has_url: bool
+) -> None:
+    url = _KEV_URL if has_url else ""
+    _patch_settings(
+        monkeypatch,
+        backchannel_judge=BackchannelJudgeSettings(url, Path("/nonexistent/api_key"), 200),
+    )
+    with (
+        TestClient(server.app) as client,
+        client.websocket_connect("/stream", headers=_AUTH_HEADERS) as websocket,
+    ):
+        started = _start(websocket, backchannel={"phrases_by_kind": _PHRASES_BY_KIND})
+        assert (started["backchannel"], started["backchannel_unavailable_reason"]) == (
+            False,
+            "unavailable",
+        )
+        websocket.send_json({"type": "end"})
+        assert websocket.receive_json()["type"] == "transcript"
+        # 順に回す指定なら、判定が使えなくても相槌は出る
+        assert _start(websocket, encoding="pcm_s16le")["backchannel"] is True
+    assert transcriber.kev_requests == []
+
+
+def test_stream_rejects_both_phrases_and_phrases_by_kind(client: TestClient) -> None:
+    with client.websocket_connect("/stream", headers=_AUTH_HEADERS) as websocket:
+        websocket.send_json(
+            {
+                "type": "start",
+                "backchannel": {"phrases": ["うん"], "phrases_by_kind": {"news": "へえ"}},
+            }
+        )
+        error = websocket.receive_json()
+        assert error["code"] == "invalid_message"
+        assert "either phrases or phrases_by_kind" in error["detail"]
+
+
+def test_stream_rotates_phrases_within_kind_across_utterances(
+    transcriber: _RecordingTranscriber, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable_kind_judge(monkeypatch, tmp_path)
+    transcriber.kev_kind = "opinion"
+    backchannel = {"phrases_by_kind": {"opinion": ["うん", "うんうん"]}, "min_interval_ms": 0}
+    texts = []
+    with (
+        TestClient(server.app) as client,
+        client.websocket_connect("/stream", headers=_AUTH_HEADERS) as websocket,
+    ):
+        for _ in range(2):
+            _start(websocket, encoding="pcm_s16le", backchannel=backchannel)
+            websocket.send_bytes(_pcm(0.2))
+            event = websocket.receive_json()
+            assert event["kind"] == "opinion"
+            texts.append(event["text"])
+            websocket.send_json({"type": "end"})
+            assert websocket.receive_json()["type"] == "transcript"
+            assert websocket.receive_json()["type"] == "ack"
+    assert texts == ["うん", "うんうん"], "同じ種類の文言は、発話をまたいで順に使う"

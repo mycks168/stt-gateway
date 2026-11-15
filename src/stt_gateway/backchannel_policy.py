@@ -3,12 +3,31 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Literal, Protocol, get_args
 
 from .audio_decoding import AudioSamples
 
-# 相槌なしで発話を進める理由。busy は予測器の上限、unavailable は予測器を作れないとき。
+# 相槌なしで発話を進める理由。busy は予測器の上限、unavailable は予測器や話の種類の判定を使えないとき。
 BackchannelUnavailableReason = Literal["busy", "unavailable"]
+
+# 相槌を打つ時点で、話し手が今何をしているか。クライアントは種類ごとに相槌の文言を指定する。
+BackchannelKind = Literal[
+    "continuing",
+    "hesitating",
+    "question_or_request",
+    "sad_or_trouble",
+    "explanation",
+    "surprising",
+    "news",
+    "seeking_agreement",
+    "opinion",
+    "happy",
+    "complaint",
+    "step_by_step",
+    "thinking_aloud",
+    "wrapping_up",
+]
+BACKCHANNEL_KINDS: tuple[BackchannelKind, ...] = get_args(BackchannelKind)
 
 
 @dataclass(frozen=True)
@@ -35,15 +54,6 @@ class BackchannelPredictor(Protocol):
         ...
 
 
-@dataclass(frozen=True)
-class BackchannelDecision:
-    """相槌を出すと決めたときの内容。"""
-
-    text: str
-    offset_ms: int
-    probability: float
-
-
 class PhraseRotation:
     """相槌の文言を順に返す。同じ文言が続くと機械的に聞こえるため、接続の間は順番を引き継ぐ。"""
 
@@ -66,25 +76,25 @@ class BackchannelTrigger:
 
     しきい値を超えている間ずっと出すと、1 つの間に何度も相槌を打ってしまうため。
     前の相槌から min_interval_ms 経つまでは出さない。予測は近い位置で続けて山を作ることがあるため。
+    文言は決めない（順に回すか、話の種類で選ぶかは呼び出し側が決める）。
     """
 
-    def __init__(self, threshold: float, min_interval_ms: int, rotation: PhraseRotation) -> None:
-        """しきい値・最短の間隔・文言の順番を受け取る。"""
+    def __init__(self, threshold: float, min_interval_ms: int) -> None:
+        """しきい値と最短の間隔を受け取る。"""
         self._threshold = threshold
         self._min_interval_ms = min_interval_ms
-        self._rotation = rotation
         self._was_above_threshold = False
         self._last_fired_offset_ms: int | None = None
 
-    def observe(self, frame: BackchannelFrame) -> BackchannelDecision | None:
-        """フレームの予測を受け取り、相槌を出すなら内容を返す。"""
+    def observe(self, frame: BackchannelFrame) -> BackchannelFrame | None:
+        """フレームの予測を受け取り、相槌を出すならそのフレームを返す。"""
         is_above_threshold = frame.probability >= self._threshold
         is_rising_edge = is_above_threshold and not self._was_above_threshold
         self._was_above_threshold = is_above_threshold
         if not is_rising_edge or self._is_within_min_interval(frame.offset_ms):
             return None
         self._last_fired_offset_ms = frame.offset_ms
-        return BackchannelDecision(self._rotation.next_phrase(), frame.offset_ms, frame.probability)
+        return frame
 
     def _is_within_min_interval(self, offset_ms: int) -> bool:
         """前の相槌から最短の間隔が経っていないかを返す。"""

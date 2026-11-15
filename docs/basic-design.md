@@ -11,6 +11,7 @@ uvicorn（STT_WORKERS 個のワーカープロセス）
                                ▼
                           stream_session.py（1 接続の発話の進行）
                             ├─ backchannel_pool.py … 予測器の貸し出し（上限つき）
+                            ├─ backchannel_judge.py … Kev で話の種類を判定（相槌の文言選び）
                             ├─ backchannel_policy.py ◀─ BackchannelPredictor（Protocol）
                             │                             └─ maai_backchannel.py … MaAI vap_bc_jp（CPU）
                             ├─ stream_options.py … 発話ごとの指定とサーバの設定の合成
@@ -47,6 +48,7 @@ uvicorn（STT_WORKERS 個のワーカープロセス）
 | `backchannel_policy.py` | 相槌の確率の列から、相槌を出すかどうかと文言を決める（純粋なロジック）。予測器のインタフェース（`BackchannelPredictor`）もここに置く |
 | `maai_backchannel.py` | MaAI（`vap_bc_jp`）で相槌の確率を予測する |
 | `backchannel_pool.py` | ワーカー内の予測器を上限数まで用意して貸し出す。上限に達していれば貸さない |
+| `backchannel_judge.py` | 途中までの書き起こしから、Kev で話の種類を判定する |
 | `ack_generator.py` | Ollama の軽量 LLM で一時的な返事を作り、失敗時は固定の文言に差し替える |
 | `ack_prompt.py` | 一時的な返事の既定のシステムプロンプトと会話例、chat API のメッセージ列の組み立て（純粋なロジック） |
 | `stream_options.py` | `start` の `ack`・`backchannel` の指定とサーバの設定から、発話ごとの設定を決める（純粋なロジック） |
@@ -102,6 +104,9 @@ ack_generator / stream_audio_decoder / pcm_audio / serial_transcriber` とする
 | `STT_ACK_MAX_CHARS` | `20` | 一時的な返事の文字数の上限。正の整数 |
 | `STT_ACK_FALLBACK_TEXT` | `ちょっと確認するね。` | LLM の返事が使えないときに返す文言。空にはできない |
 | `STT_ACK_KEEP_ALIVE` | `30m` | Ollama にモデルを GPU に置いたままにさせる時間（Ollama の `keep_alive` の書式） |
+| `STT_BACKCHANNEL_JUDGE_URL` | (空) | 話の種類を判定する Kev の URL（例: `http://127.0.0.1:8009`）。空なら話の種類に合わせた相槌は使えない |
+| `STT_BACKCHANNEL_JUDGE_TOKEN_FILE` | `~/.config/kev/api_key` | Kev の Bearer トークンを書いたファイル。`~` はサーバを動かすユーザのホーム |
+| `STT_BACKCHANNEL_JUDGE_TIMEOUT_MS` | `200` | 相槌を出すと決めてから、途中の文字起こしと話の種類の判定を待つ上限（ミリ秒）。正の整数 |
 
 範囲外の値、または数値として読めない値の場合は、起動時に `ValueError` で停止する。
 
@@ -237,6 +242,36 @@ haas で extras が入っていない場合、理由は
 | `phrases` | 文字列（1〜20 文字）の配列、1〜10 個 | `STT_BACKCHANNEL_PHRASES` |
 | `threshold` | 数値、0 より大きく 1 以下 | `STT_BACKCHANNEL_THRESHOLD` |
 | `min_interval_ms` | 整数、0〜60,000 | `STT_BACKCHANNEL_MIN_INTERVAL_MS` |
+| `phrases_by_kind` | 話の種類（下表）から文言への対応、1〜14 個。文言は 1〜20 文字の文字列、または 1〜5 個の配列 | 指定しない（`phrases` を順に使う） |
+
+- `phrases` と `phrases_by_kind` を両方指定すると `invalid_message` になる。
+- `phrases_by_kind` を指定した発話では、相槌を出すたびに話の種類を判定し、その種類の文言を返す
+  （下の「相槌の決め方」）。指定していない種類と判定したときは相槌を出さない。
+- 1 つの種類に配列で複数の文言を指定すると、その種類の相槌では配列の順に使う。同じ種類で同じ
+  言葉が続くと機械的に聞こえるため。順番は接続の中で種類ごとに引き継ぎ、前の発話とその種類の
+  文言が違う場合は先頭から使う。送らなかった相槌（発話の終了後に判定が終わったものなど）では
+  順番を進めない。
+- `phrases_by_kind` を指定したが `STT_BACKCHANNEL_JUDGE_URL` が空、または Kev のトークンを読めない
+  場合は、その発話を相槌なしで進める（`started` の `backchannel_unavailable_reason` が `unavailable`）。
+
+話の種類（`kind`）：
+
+| `kind` | 内容 | 合う相槌の例 |
+|---|---|---|
+| `continuing` | 話の途中で間を空けただけで、続きを話す | うん |
+| `hesitating` | 言いよどんでいる、言葉を探している | （出さない） |
+| `question_or_request` | 質問や依頼をしている | （出さない） |
+| `sad_or_trouble` | 悲しいこと、つらいこと、困ったことを話している | そっか |
+| `explanation` | 理由や原因、どう解決したかを説明している | なるほど |
+| `surprising` | 意外なこと、すごいこと、うれしいことを話している | へえ |
+| `news` | ふつうの出来事や知らせを話し終えた | そうなんだ |
+| `seeking_agreement` | 同意を求めている（「〜だよね」「〜でしょ」） | うん |
+| `opinion` | 自分の意見や感想を言っている（「〜と思う」） | うん |
+| `happy` | 嬉しいこと、楽しいこと、ほっとしたことを話している | いいね |
+| `complaint` | 愚痴や不満を言っている | そっか |
+| `step_by_step` | 順番に説明している途中で、次の手順に続く | うん |
+| `thinking_aloud` | 考えながら話している、迷っている（「どうしようかな」） | （出さない） |
+| `wrapping_up` | 話をまとめて終えようとしている（「って感じ」「以上です」） | （出さない） |
 
 - 範囲外の値、型の誤り、未知のフィールド（`system_promt` のような綴りの誤りを黙って無視しない
   ため）は `invalid_message` になり、その発話は始まらない。
@@ -252,7 +287,7 @@ haas で extras が入っていない場合、理由は
 | `type` | 送るとき | フィールド |
 |---|---|---|
 | `started` | `start` を受け付けたとき | `utterance_id`、`backchannel`（この発話で相槌を出すか。bool）、`backchannel_unavailable_reason`（`backchannel` が `false` のとき `"busy"` \| `"unavailable"`、それ以外は `null`） |
-| `backchannel` | 発話中、相槌を打つべきと予測したとき | `utterance_id`、`text`（相槌の文言）、`offset_ms`（発話の先頭からの音声上の位置。int）、`probability`（予測した確率） |
+| `backchannel` | 発話中、相槌を打つべきと予測したとき | `utterance_id`、`text`（相槌の文言）、`offset_ms`（発話の先頭からの音声上の位置。int）、`probability`（予測した確率）、`kind`（判定した話の種類。`phrases_by_kind` を指定しない発話では `null`） |
 | `transcript` | `end` の後、文字起こしが終わったとき | `utterance_id`、`text`、`language`、`duration`、`latency_ms`、`backend`、`model`（各フィールドの意味は `/transcribe` の応答と同じ） |
 | `ack` | `transcript` の後、一時的な返事ができたとき | `utterance_id`、`text`、`source`（`"llm"` \| `"fallback"`）、`latency_ms`（`transcript` を送ってから `ack` を送るまで） |
 | `error` | 下表のとき | `utterance_id`、`code`、`detail` |
@@ -286,8 +321,25 @@ haas で extras が入っていない場合、理由は
   超えたフレームで 1 回だけ相槌を出す（超えている間に何度も出さない）。
 - 前の相槌から最短の間隔（`backchannel.min_interval_ms`、省略時は `STT_BACKCHANNEL_MIN_INTERVAL_MS`）
   が経っていなければ出さない。`offset_ms`（音声上の時刻）で測る。
-- 文言（`backchannel.phrases`、省略時は `STT_BACKCHANNEL_PHRASES`）を順に使う。同じ文言が続かない
-  ようにするため。
+- `phrases_by_kind` を指定しない発話では、文言（`backchannel.phrases`、省略時は
+  `STT_BACKCHANNEL_PHRASES`）を順に使う。同じ文言が続かないようにするため。
+- `phrases_by_kind` を指定した発話では、相槌を出すと決めたフレームまでの音声を文字起こしし、
+  Kev（判断だけを返すモデル。`/v1/systemone`）に話の種類を 1 つ選ばせ、その種類の文言を返す。
+  - Kev に渡すのは、途中までの文字起こしの最後の文（句点・疑問符・感嘆符で区切る）。
+    文末まで届いていない場合は最後の断片を使う。過去の文の質問や言いよどみで、
+    現在話している内容の種類を変えないため。
+  - Kev には「どの相槌が合うか」ではなく「話し手が今何をしているか」を、英語の指示と英語の
+    選択肢の説明で聞く（書き起こしは日本語のまま渡す）。26 件の比較で、相槌の候補から直接選ばせると
+    13 件、日本語の指示で種類を聞くと 18 件、英語の指示で種類を聞くと 23 件が合っていた。
+  - 途中の文字起こしと判定に `STT_BACKCHANNEL_JUDGE_TIMEOUT_MS` より長くかかったら、その相槌は
+    出さない。遅れて出すと話の続きにかぶるため。Kev に接続できない・失敗した場合も出さない。
+  - 時間切れでも途中の文字起こしは止めない。推論のスレッドは途中で止められず、待たずに止めると
+    `SerialTranscriber` の順番待ちを抜けて GPU 上の推論が重なるため。結果は捨てる。
+  - 話の種類を判定しても相槌を出さなかったときも、最短の間隔は数える。
+  - 起動スクリプトは `scripts/logging.json` で `stt_gateway` の INFO ログを有効にする。
+    種類別相槌の送信・見送りごとに発話番号、音声位置、種類、所要時間、理由を残す。
+    理由は `sent`、`unmapped_kind`、`timeout`、`judge_unavailable`、`closed`。
+    発話本文と認証トークンは含めない。
 
 #### 一時的な返事の作り方
 
@@ -391,6 +443,8 @@ Haas-ja の出力は「、」はある程度付くが「。」はほとんど付
      ユーザの音声と同じ長さの無音を渡す。
    - 予測器は別スレッドで推論し、結果をイベントループへ渡す。推論中も音声の受信を止めない。
    - 相槌を出すかどうかは `backchannel_policy.py` が決める（2.4 の「相槌の決め方」）。
+   - `phrases_by_kind` を指定した発話では、相槌を出すと決めるたびに、途中の文字起こしと話の種類の
+     判定を別のタスクで行う。予測の処理はその完了を待たずに続ける。
 4. `end` を受けたら、その発話の予測器への入力を止め、バッファを WAV の一時ファイルに書き出して
    `SerialTranscriber` で文字起こしする。`/transcribe` と同じ順番待ちに入るため、GPU 上の推論が
    重ならない。一時ファイルは成否にかかわらず削除する。
@@ -418,6 +472,7 @@ Haas-ja の出力は「、」はある程度付くが「。」はほとんど付
 | extras `haas` | haas-asr（GitHub のコミット固定）、torch 2.14.0。Python 3.11 以上かつ Linux のみ |
 | extras `stream` | maai。`/stream` で相槌を出す場合だけ必要 |
 | 外部サービス | Ollama（一時的な返事を作る LLM）。`/stream` を使う場合だけ必要 |
+| 外部サービス | Kev（[jaredpalmer/kev](https://github.com/jaredpalmer/kev)、Apache-2.0。Kev-0.8B を GPU で約 1.9GB）。`phrases_by_kind` を使う場合だけ必要 |
 
 - **MaAI のモデル**：相槌の予測には `maai-kyoto/vap_bc_jp`（MIT）だけを使う。話者交代の予測
   （`vap_jp`）と発話区間の検出（`vad_jp`）は非商用ライセンス（CC BY-NC-ND 4.0）のため使わない。
@@ -457,6 +512,15 @@ FastAPI の `HTTPBearer` で `Authorization` ヘッダを必須にし、`STT_API
 ヘッダの解釈とトークンの比較は `/transcribe` と共通の関数にまとめ、両方から呼ぶ。
 トークンは URL のクエリでは受け取らない。アクセスログやプロキシのログに残るため。
 
+Kev は CUDA Graph を使わずに動かす（`KEV_CUDA_GRAPHS=0`）。使うと GPU を約 4GB 使い、同じ GPU の Haas が
+推論の準備（CUDA Graph の作成）でメモリ不足になり、以後の文字起こしがすべて失敗するため。使わない場合は
+約 1.9GB で、判定は約 30ms（使う場合は約 20ms）。
+
+Kev は `127.0.0.1` だけで待ち受け、`KEV_API_KEY` で Bearer 認証を必須にして動かす。同じマシンで
+動くほかのプロセスからも呼べないようにするため。トークンは `STT_BACKCHANNEL_JUDGE_TOKEN_FILE` の
+ファイル（権限 600）に置き、ワーカーの起動時に読む。読めなければ、話の種類に合わせた相槌だけを
+使えなくして起動を続ける。
+
 ## 6. テスト
 
 モデルはダミーに差し替え、GPU とモデル本体なしで実行する。`SerialTranscriber` は、
@@ -477,5 +541,7 @@ FastAPI の `HTTPBearer` で `Authorization` ヘッダを必須にし、`STT_API
   範囲外の指定が `invalid_message` になること、`ack: false` で ack を送らないこと
 - 一時的な返事の整形と、タイムアウト・接続失敗・文字数超過のときの固定文言への差し替え
 - Opus パケットと PCM のデコード（実際に PyAV でエンコードした Opus を使う）と、壊れたパケットの扱い
+- `phrases_by_kind` の指定で、判定した種類の文言と `kind` が届くこと、対応の無い種類・時間切れ・
+  Kev の失敗では相槌が届かないこと、判定が使えないときに `unavailable` になること（Kev はダミー）
 
 MaAI と Ollama を実際に使う確認は、自動テストとは別に手動で行う。

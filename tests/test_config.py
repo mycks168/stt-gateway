@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from stt_gateway.config import (
+    BackchannelJudgeSettings,
     BackchannelSettings,
     load_ack_settings,
+    load_backchannel_judge_settings,
     load_backchannel_settings,
     load_max_utterance_seconds,
     parse_backend,
@@ -117,3 +121,23 @@ def test_max_utterance_seconds_must_be_positive(clean_stream_env: pytest.MonkeyP
     clean_stream_env.setenv("STT_STREAM_MAX_UTTERANCE_SECONDS", "0")
     with pytest.raises(ValueError, match="STT_STREAM_MAX_UTTERANCE_SECONDS"):
         load_max_utterance_seconds()
+
+
+def test_backchannel_judge_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "STT_BACKCHANNEL_JUDGE_URL",
+        "STT_BACKCHANNEL_JUDGE_TOKEN_FILE",
+        "STT_BACKCHANNEL_JUDGE_TIMEOUT_MS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    defaults = load_backchannel_judge_settings()
+    assert defaults == BackchannelJudgeSettings("", Path("~/.config/kev/api_key"), 200)
+
+    monkeypatch.setenv("STT_BACKCHANNEL_JUDGE_URL", " http://127.0.0.1:8009/ ")
+    monkeypatch.setenv("STT_BACKCHANNEL_JUDGE_TIMEOUT_MS", "150")
+    assert load_backchannel_judge_settings().url == "http://127.0.0.1:8009"
+    assert load_backchannel_judge_settings().timeout_ms == 150
+
+    monkeypatch.setenv("STT_BACKCHANNEL_JUDGE_TIMEOUT_MS", "0")
+    with pytest.raises(ValueError, match="STT_BACKCHANNEL_JUDGE_TIMEOUT_MS"):
+        load_backchannel_judge_settings()

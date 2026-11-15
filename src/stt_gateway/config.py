@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import get_args
 
 from dotenv import load_dotenv
@@ -92,6 +93,15 @@ class AckSettings:
     keep_alive: str
 
 
+@dataclass(frozen=True)
+class BackchannelJudgeSettings:
+    """/stream で相槌の文言を話の種類に合わせて選ぶ、Kev の設定。url が空なら使わない。"""
+
+    url: str
+    token_file: Path
+    timeout_ms: int
+
+
 def load_backchannel_settings() -> BackchannelSettings:
     """相槌の設定を環境変数から読む。"""
     return BackchannelSettings(
@@ -104,6 +114,15 @@ def load_backchannel_settings() -> BackchannelSettings:
             "STT_BACKCHANNEL_PHRASES",
             os.getenv("STT_BACKCHANNEL_PHRASES", DEFAULT_BACKCHANNEL_PHRASES),
         ),
+    )
+
+
+def load_backchannel_judge_settings() -> BackchannelJudgeSettings:
+    """話の種類の判定（Kev）の設定を環境変数から読む。"""
+    return BackchannelJudgeSettings(
+        url=os.getenv("STT_BACKCHANNEL_JUDGE_URL", "").strip().rstrip("/"),
+        token_file=Path(os.getenv("STT_BACKCHANNEL_JUDGE_TOKEN_FILE", "~/.config/kev/api_key")),
+        timeout_ms=_read_int("STT_BACKCHANNEL_JUDGE_TIMEOUT_MS", "200", minimum=1),
     )
 
 
@@ -144,6 +163,9 @@ class Settings:
     api_key: str = os.getenv("STT_API_KEY", "")
     stream_max_utterance_seconds: float = field(default_factory=load_max_utterance_seconds)
     backchannel: BackchannelSettings = field(default_factory=load_backchannel_settings)
+    backchannel_judge: BackchannelJudgeSettings = field(
+        default_factory=load_backchannel_judge_settings
+    )
     ack: AckSettings = field(default_factory=load_ack_settings)
 
 

@@ -27,7 +27,9 @@ from pydantic import BaseModel
 
 from .ack_generator import AckGenerator
 from .auth import is_token_accepted
+from .backchannel_judge import BackchannelKindJudge, read_judge_token
 from .backchannel_pool import BackchannelPool
+from .backchannel_stream import KindJudging
 from .backends import describe_backend, load_transcriber
 from .config import settings
 from .formats import UnsupportedAudioFormat, resolve_suffix
@@ -45,16 +47,32 @@ def load_configured_transcriber() -> Transcriber:
     return load_transcriber(settings)
 
 
-def create_ack_http_client() -> httpx.AsyncClient:
-    """一時的な返事を作るために Ollama を呼ぶ HTTP クライアントを作る。
+def create_http_client() -> httpx.AsyncClient:
+    """Ollama と Kev を呼ぶ HTTP クライアントを作る。
 
-    タイムアウトは AckGenerator が STT_ACK_TIMEOUT_MS で全体にかけるため、ここでは設定しない。
+    待つ上限は呼び出し側（STT_ACK_TIMEOUT_MS・Kev への 1 回ごとの上限）が決めるため、ここでは設定しない。
     """
     return httpx.AsyncClient(timeout=None)
 
 
+def build_kind_judging(
+    serial_transcriber: SerialTranscriber, client: httpx.AsyncClient
+) -> KindJudging | None:
+    """話の種類の判定（Kev）を用意する。URL が空、またはトークンを読めなければ None を返す。"""
+    judge_settings = settings.backchannel_judge
+    if not judge_settings.url:
+        return None
+    try:
+        token = read_judge_token(judge_settings.token_file)
+    except ValueError:
+        logger.exception("backchannel kind judge is disabled (url=%s)", judge_settings.url)
+        return None
+    judge = BackchannelKindJudge(judge_settings.url, token, client)
+    return KindJudging(judge, serial_transcriber, judge_settings.timeout_ms)
+
+
 def build_stream_dependencies(
-    serial_transcriber: SerialTranscriber, ack_generator: AckGenerator
+    serial_transcriber: SerialTranscriber, ack_generator: AckGenerator, client: httpx.AsyncClient
 ) -> StreamDependencies:
     """このワーカーの /stream 用の部品を、現在の設定から組み立てる。"""
     return StreamDependencies(
@@ -66,6 +84,7 @@ def build_stream_dependencies(
         max_utterance_seconds=settings.stream_max_utterance_seconds,
         backchannel=settings.backchannel,
         ack=settings.ack,
+        kind_judging=build_kind_judging(serial_transcriber, client),
     )
 
 
@@ -79,9 +98,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     serial_transcriber = SerialTranscriber(load_configured_transcriber)
     app.state.serial_transcriber = serial_transcriber
-    ack_http_client = create_ack_http_client()
-    ack_generator = AckGenerator(settings.ack, ack_http_client)
-    app.state.stream_dependencies = build_stream_dependencies(serial_transcriber, ack_generator)
+    http_client = create_http_client()
+    ack_generator = AckGenerator(settings.ack, http_client)
+    app.state.stream_dependencies = build_stream_dependencies(
+        serial_transcriber, ack_generator, http_client
+    )
     ack_warm_up = asyncio.create_task(ack_generator.warm_up())
     try:
         await serial_transcriber.preload()
@@ -94,7 +115,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         ack_warm_up.cancel()
-        await ack_http_client.aclose()
+        await http_client.aclose()
 
 
 app = FastAPI(title="stt-gateway", version="0.4.0", lifespan=lifespan)

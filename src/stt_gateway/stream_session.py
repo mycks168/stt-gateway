@@ -4,23 +4,29 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import tempfile
 import time
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Protocol
 
 import numpy as np
 from pydantic import ValidationError
 
 from .ack_generator import AckGenerator, AckRequest
 from .audio_decoding import AudioSamples
-from .backchannel_policy import BackchannelPredictor, BackchannelTrigger, PhraseRotation
-from .backchannel_pool import BackchannelPool, LeasedPredictor
+from .backchannel_policy import BackchannelKind, BackchannelTrigger, PhraseRotation
+from .backchannel_pool import BackchannelPool, LeasedPredictor, PredictorRefusal
+from .backchannel_stream import (
+    BackchannelEmitter,
+    BackchannelStream,
+    KindEmitter,
+    KindJudging,
+    KindTarget,
+    RotationEmitter,
+    samples_until_offset,
+)
 from .backends import BackendDescription
 from .config import AckSettings, BackchannelSettings
-from .pcm_audio import write_wav
+from .sample_transcription import transcribe_samples
 from .serial_transcriber import SerialTranscriber
 from .stream_audio_decoder import (
     STREAM_SAMPLE_RATE_HZ,
@@ -31,18 +37,19 @@ from .stream_audio_decoder import (
 from .stream_messages import (
     CLIENT_MESSAGE_ADAPTER,
     AckEvent,
-    BackchannelEvent,
     EndMessage,
     ErrorEvent,
+    EventSender,
     StartedEvent,
     StartMessage,
     StreamErrorCode,
-    StreamEvent,
     TranscriptEvent,
     UtteranceId,
 )
 from .stream_options import (
     BackchannelRule,
+    KindPhrasing,
+    RotationPhrasing,
     resolve_ack_request,
     resolve_backchannel_rule,
 )
@@ -53,14 +60,6 @@ logger = logging.getLogger(__name__)
 # 相槌の予測モデルが日本語用のため、/stream は日本語だけを受け付ける。
 SUPPORTED_LANGUAGES: tuple[str, ...] = ("ja",)
 MILLISECONDS_PER_SECOND = 1000
-
-
-class EventSender(Protocol):
-    """クライアントへイベントを送る。切断後に呼ばれても例外にしない。"""
-
-    async def send(self, event: StreamEvent) -> None:
-        """イベントを 1 つ送る。"""
-        ...
 
 
 @dataclass(frozen=True)
@@ -75,91 +74,7 @@ class StreamDependencies:
     max_utterance_seconds: float
     backchannel: BackchannelSettings
     ack: AckSettings
-
-
-class _BackchannelStream:
-    """1 つの発話の音声を予測器へ渡し、相槌のイベントを送る。
-
-    予測は CPU を使う重い処理のため別スレッドで行い、音声の受信を止めない。
-    予測器は発話が終わってスレッド上の処理も終わってから返す。予測中に返すと、
-    次の発話が同じ予測器を同時に使ってしまうため。
-    """
-
-    def __init__(
-        self,
-        utterance_id: UtteranceId,
-        predictor: BackchannelPredictor,
-        trigger: BackchannelTrigger,
-        pool: BackchannelPool,
-        sender: EventSender,
-    ) -> None:
-        """予測に使う部品を受け取り、予測のタスクを始める。"""
-        self._utterance_id = utterance_id
-        self._predictor = predictor
-        self._trigger = trigger
-        self._pool = pool
-        self._sender = sender
-        self._inputs: asyncio.Queue[AudioSamples | None] = asyncio.Queue()
-        self._is_open = True
-        self.task = asyncio.create_task(self._run())
-
-    def feed(self, samples: AudioSamples) -> None:
-        """音声を予測の待ち行列に入れる。"""
-        self._inputs.put_nowait(samples)
-
-    def close(self) -> None:
-        """発話の終了。これ以降に確定した予測は送らない。"""
-        self._is_open = False
-        self._inputs.put_nowait(None)
-
-    async def _run(self) -> None:
-        """待ち行列の音声を予測し、相槌を出すと決めたらイベントを送る。最後に予測器を返す。"""
-        try:
-            await asyncio.to_thread(self._predictor.reset)
-            while (samples := await self._next_batch()) is not None:
-                if self._is_open:
-                    await self._predict_and_send(samples)
-        except Exception:
-            logger.exception("backchannel prediction failed (utterance_id=%d)", self._utterance_id)
-            await self._discard_until_closed()
-        finally:
-            self._pool.release(self._predictor)
-
-    async def _next_batch(self) -> AudioSamples | None:
-        """次の音声を取り出す。予測が遅れて溜まっていれば、まとめて 1 回で予測する。"""
-        first = await self._inputs.get()
-        if first is None:
-            return None
-        batch = [first]
-        while not self._inputs.empty():
-            queued = self._inputs.get_nowait()
-            if queued is None:
-                # 終了の印は戻し、溜まっていた分を予測した後のループで受け取る。
-                self._inputs.put_nowait(None)
-                break
-            batch.append(queued)
-        return np.concatenate(batch)
-
-    async def _predict_and_send(self, samples: AudioSamples) -> None:
-        """予測して、相槌を出すフレームがあればイベントを送る。"""
-        frames = await asyncio.to_thread(self._predictor.predict, samples)
-        for frame in frames:
-            decision = self._trigger.observe(frame)
-            if decision is None or not self._is_open:
-                continue
-            await self._sender.send(
-                BackchannelEvent(
-                    utterance_id=self._utterance_id,
-                    text=decision.text,
-                    offset_ms=decision.offset_ms,
-                    probability=decision.probability,
-                )
-            )
-
-    async def _discard_until_closed(self) -> None:
-        """予測に失敗した後は、終了の印が来るまで音声を捨てる。"""
-        while await self._inputs.get() is not None:
-            pass
+    kind_judging: KindJudging | None
 
 
 @dataclass
@@ -169,10 +84,22 @@ class _ReceivingUtterance:
     utterance_id: UtteranceId
     language: str
     decoder: StreamAudioDecoder
-    backchannel: _BackchannelStream | None
     ack_request: AckRequest | None
+    backchannel: BackchannelStream | None = None
     chunks: list[AudioSamples] = field(default_factory=list)
     sample_count: int = 0
+
+    def samples_until(self, offset_ms: int) -> AudioSamples:
+        """受け取った音声の先頭から offset_ms までを返す。"""
+        return samples_until_offset(self.chunks, offset_ms)
+
+
+@dataclass(frozen=True)
+class _KindPlan:
+    """話の種類で文言を選ぶときの、種類ごとの文言と判定の部品。"""
+
+    phrasing: KindPhrasing
+    judging: KindJudging
 
 
 @dataclass(frozen=True)
@@ -201,9 +128,10 @@ class StreamSession:
         self._sender = sender
         self._rotation_phrases = dependencies.backchannel.phrases
         self._rotation = PhraseRotation(self._rotation_phrases)
+        self._kind_rotations: dict[BackchannelKind, tuple[tuple[str, ...], PhraseRotation]] = {}
         self._current: _ReceivingUtterance | _DiscardingUtterance | None = None
         self._last_utterance_id = 0
-        self._background_tasks: set[asyncio.Task[None]] = set()
+        self._background_tasks: set[asyncio.Task[object]] = set()
 
     async def handle_text(self, text: str) -> None:
         """テキストのメッセージ（start / end）を処理する。"""
@@ -279,42 +207,71 @@ class StreamSession:
         self._last_utterance_id += 1
         utterance_id = UtteranceId(self._last_utterance_id)
         rule = resolve_backchannel_rule(message.backchannel, self._dependencies.backchannel)
-        lease = await self._dependencies.backchannel_pool.acquire()
-        backchannel = (
-            self._start_backchannel(utterance_id, lease, rule)
-            if isinstance(lease, LeasedPredictor)
-            else None
-        )
-        self._current = _ReceivingUtterance(
+        utterance = _ReceivingUtterance(
             utterance_id,
             language,
             create_stream_audio_decoder(message.encoding),
-            backchannel,
             resolve_ack_request(message.ack, self._dependencies.ack),
         )
+        plan = self._plan_phrasing(rule.phrasing)
+        lease = (
+            PredictorRefusal("unavailable")
+            if plan is None
+            else await self._dependencies.backchannel_pool.acquire()
+        )
+        if isinstance(lease, LeasedPredictor) and plan is not None:
+            utterance.backchannel = self._start_backchannel(utterance, lease, rule, plan)
+        self._current = utterance
         await self._sender.send(
             StartedEvent(
                 utterance_id=utterance_id,
-                backchannel=backchannel is not None,
+                backchannel=utterance.backchannel is not None,
                 backchannel_unavailable_reason=None
                 if isinstance(lease, LeasedPredictor)
                 else lease.reason,
             )
         )
 
+    def _plan_phrasing(
+        self, phrasing: RotationPhrasing | KindPhrasing
+    ) -> RotationPhrasing | _KindPlan | None:
+        """文言の決め方を決める。話の種類で選ぶ指定なのに判定を使えないときは None を返す。"""
+        if isinstance(phrasing, RotationPhrasing):
+            return phrasing
+        if self._dependencies.kind_judging is None:
+            return None
+        return _KindPlan(phrasing, self._dependencies.kind_judging)
+
     def _start_backchannel(
-        self, utterance_id: UtteranceId, lease: LeasedPredictor, rule: BackchannelRule
-    ) -> _BackchannelStream:
+        self,
+        utterance: _ReceivingUtterance,
+        lease: LeasedPredictor,
+        rule: BackchannelRule,
+        plan: RotationPhrasing | _KindPlan,
+    ) -> BackchannelStream:
         """借りた予測器で、この発話の相槌の予測を始める。"""
-        trigger = BackchannelTrigger(
-            rule.threshold, rule.min_interval_ms, self._rotation_for(rule.phrases)
-        )
-        return _BackchannelStream(
-            utterance_id,
+        return BackchannelStream(
+            utterance.utterance_id,
             lease.predictor,
-            trigger,
+            BackchannelTrigger(rule.threshold, rule.min_interval_ms),
             self._dependencies.backchannel_pool,
+            self._emitter_for(utterance, plan),
+        )
+
+    def _emitter_for(
+        self, utterance: _ReceivingUtterance, plan: RotationPhrasing | _KindPlan
+    ) -> BackchannelEmitter:
+        """文言を順に回すか、話の種類で選ぶかに応じた emitter を作る。"""
+        if isinstance(plan, RotationPhrasing):
+            return RotationEmitter(
+                utterance.utterance_id, self._rotation_for(plan.phrases), self._sender
+            )
+        return KindEmitter(
+            KindTarget(utterance.utterance_id, utterance.language, utterance.samples_until),
+            self._kind_rotations_for(plan.phrasing),
+            plan.judging,
             self._sender,
+            self._track,
         )
 
     def _rotation_for(self, phrases: tuple[str, ...]) -> PhraseRotation:
@@ -323,6 +280,17 @@ class StreamSession:
             self._rotation_phrases = phrases
             self._rotation = PhraseRotation(phrases)
         return self._rotation
+
+    def _kind_rotations_for(self, phrasing: KindPhrasing) -> dict[BackchannelKind, PhraseRotation]:
+        """種類ごとの文言の順番を返す。前の発話と文言が同じ種類は、順番を引き継ぐ。"""
+        rotations: dict[BackchannelKind, PhraseRotation] = {}
+        for kind, phrases in phrasing.phrases_by_kind.items():
+            previous = self._kind_rotations.get(kind)
+            if previous is None or previous[0] != phrases:
+                previous = (phrases, PhraseRotation(phrases))
+                self._kind_rotations[kind] = previous
+            rotations[kind] = previous[1]
+        return rotations
 
     async def _end_utterance(self, message: EndMessage) -> None:
         """発話を終え、文字起こしと一時的な返事をバックグラウンドで作る。"""
@@ -380,7 +348,9 @@ class StreamSession:
         """文字起こしして transcript を送る。失敗したら error を送って None を返す。"""
         started_at = time.perf_counter()
         try:
-            transcription = await self._transcribe(utterance)
+            transcription = await transcribe_samples(
+                self._dependencies.serial_transcriber, utterance.samples, utterance.language
+            )
         except Exception as error:
             logger.exception(
                 "stream transcription failed (utterance_id=%d)", utterance.utterance_id
@@ -403,20 +373,6 @@ class StreamSession:
         )
         return transcription
 
-    async def _transcribe(self, utterance: _FinishedUtterance) -> Transcription:
-        """音声を WAV の一時ファイルにして、/transcribe と同じ順番待ちで文字起こしする。"""
-        if len(utterance.samples) == 0:
-            # 音声の無い発話はバックエンドに渡すと失敗しうるため、推論せずに空の結果にする。
-            return Transcription(text="", language=utterance.language, duration_seconds=0.0)
-        # 60 秒の音声で約 2MB を書き出すため、ファイル操作もイベントループの外で行う。
-        audio_path = await asyncio.to_thread(_write_temporary_wav, utterance.samples)
-        try:
-            return await self._dependencies.serial_transcriber.transcribe(
-                audio_path, utterance.language
-            )
-        finally:
-            await asyncio.to_thread(audio_path.unlink, missing_ok=True)
-
     async def _send_error(
         self, code: StreamErrorCode, detail: str, utterance_id: UtteranceId | None = None
     ) -> None:
@@ -426,18 +382,13 @@ class StreamSession:
         await self._sender.send(ErrorEvent(utterance_id=utterance_id, code=code, detail=detail))
 
     def _spawn(self, coroutine: Coroutine[object, object, None]) -> None:
-        """バックグラウンドのタスクを始め、終わるまで参照を持っておく（途中で回収されないため）。"""
-        task = asyncio.create_task(coroutine)
+        """バックグラウンドのタスクを始めて登録する。"""
+        self._track(asyncio.create_task(coroutine))
+
+    def _track(self, task: asyncio.Task[object]) -> None:
+        """タスクが終わるまで参照を持っておく（途中で回収されないため）。"""
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
-
-
-def _write_temporary_wav(samples: AudioSamples) -> Path:
-    """波形を WAV の一時ファイルに書き出してパスを返す。削除は呼び出し側が行う。"""
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-        audio_path = Path(temp_file.name)
-    write_wav(audio_path, samples, STREAM_SAMPLE_RATE_HZ)
-    return audio_path
 
 
 def _elapsed_ms(started_at: float) -> int:
