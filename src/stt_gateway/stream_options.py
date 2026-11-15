@@ -33,10 +33,14 @@ class KindPhrasing:
 
 @dataclass(frozen=True)
 class BackchannelRule:
-    """1 つの発話で相槌を出す規則。"""
+    """1 つの発話で相槌を出す規則。
+
+    boundary_threshold は、相槌を送る言い終わりの区切りらしさの下限。0 なら区切りを判定しない。
+    """
 
     timing: BackchannelTiming
     interval: BackchannelInterval
+    boundary_threshold: float
     phrasing: RotationPhrasing | KindPhrasing
 
 
@@ -49,6 +53,9 @@ def resolve_backchannel_rule(
     return BackchannelRule(
         timing=_resolve_timing(options, defaults),
         interval=_resolve_interval(options, defaults),
+        boundary_threshold=_given_or_default(
+            options.boundary_threshold, defaults.boundary_threshold
+        ),
         phrasing=_resolve_phrasing(options, defaults),
     )
 
@@ -75,11 +82,15 @@ def _given_or_default(given: _Value | None, default: _Value) -> _Value:
 def _resolve_timing(
     options: BackchannelOptions, defaults: BackchannelSettings
 ) -> BackchannelTiming:
-    """タイミングの決め方を決める。選ばなかった決め方の項目（threshold か silence_ms）は使わない。"""
+    """タイミングの決め方を決める。選ばなかった決め方の項目は使わない。
+
+    threshold は maai、silence_ms と min_new_speech_ms は silence の項目。
+    """
     timing = defaults.timing if options.timing is None else options.timing
     if timing == "silence":
         return SilenceTiming(
-            defaults.silence_ms if options.silence_ms is None else options.silence_ms
+            _given_or_default(options.silence_ms, defaults.silence_ms),
+            _given_or_default(options.min_new_speech_ms, defaults.min_new_speech_ms),
         )
     return ProbabilityTiming(defaults.threshold if options.threshold is None else options.threshold)
 

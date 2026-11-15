@@ -14,18 +14,26 @@ from pydantic import ValidationError
 
 from .ack_generator import AckGenerator, AckRequest
 from .audio_decoding import AudioSamples
+from .backchannel_emitters import (
+    BackchannelDelivery,
+    BackchannelEmitter,
+    JudgedUtterance,
+    JudgingEmitter,
+    JudgingRule,
+    PhraseSource,
+    RotationEmitter,
+    SpeechJudging,
+)
+from .backchannel_interval import BackchannelPacing
 from .backchannel_policy import BackchannelKind, PhraseRotation
 from .backchannel_pool import BackchannelPool, LeasedPredictor, PredictorRefusal
-from .backchannel_stream import (
-    BackchannelEmitter,
-    BackchannelStream,
-    KindEmitter,
-    KindJudging,
-    KindTarget,
-    RotationEmitter,
-    recent_samples,
+from .backchannel_stream import BackchannelStream, recent_samples
+from .backchannel_triggers import (
+    BackchannelTiming,
+    ProbabilityTiming,
+    create_pacing,
+    create_trigger,
 )
-from .backchannel_triggers import BackchannelTiming, ProbabilityTiming, create_trigger
 from .backends import BackendDescription
 from .config import AckSettings, BackchannelSettings
 from .sample_transcription import transcribe_samples
@@ -63,7 +71,7 @@ logger = logging.getLogger(__name__)
 # 相槌の予測モデルが日本語用のため、/stream は日本語だけを受け付ける。
 SUPPORTED_LANGUAGES: tuple[str, ...] = ("ja",)
 MILLISECONDS_PER_SECOND = 1000
-# 話の種類の判定では、途中の文字起こしを直近のこの長さだけにする。発話の頭から文字起こしすると
+# 相槌の判定では、途中の文字起こしを直近のこの長さだけにする。発話の頭から文字起こしすると
 # 長い話ほど判定が遅れて時間切れになるため。Kev に渡すのは最後の文だけで、ARGOS の録音では
 # 直近 15 秒で 25 件中 22 件が頭からと同じ種類になった（10 秒は 15 件、8 秒は 9 件）。
 PARTIAL_TRANSCRIPTION_WINDOW_MS = 15_000
@@ -82,7 +90,7 @@ class StreamDependencies:
     max_utterance_seconds: float
     backchannel: BackchannelSettings
     ack: AckSettings
-    kind_judging: KindJudging | None
+    speech_judging: SpeechJudging | None
     recorder: UtteranceRecorder | None = None
 
 
@@ -108,7 +116,7 @@ class _ReceivingUtterance:
     sample_count: int = 0
 
     def samples_until(self, offset_ms: int) -> AudioSamples:
-        """話の種類の判定に使う、offset_ms までの直近 PARTIAL_TRANSCRIPTION_WINDOW_MS の音声を返す。"""
+        """相槌の判定に使う、offset_ms までの直近 PARTIAL_TRANSCRIPTION_WINDOW_MS の音声を返す。"""
         return recent_samples(self.chunks, offset_ms, PARTIAL_TRANSCRIPTION_WINDOW_MS)
 
     def all_samples(self) -> AudioSamples:
@@ -117,14 +125,6 @@ class _ReceivingUtterance:
             return np.zeros(0, dtype=np.float32)
         samples: AudioSamples = np.concatenate(self.chunks)
         return samples
-
-
-@dataclass(frozen=True)
-class _KindPlan:
-    """話の種類で文言を選ぶときの、種類ごとの文言と判定の部品。"""
-
-    phrasing: KindPhrasing
-    judging: KindJudging
 
 
 @dataclass(frozen=True)
@@ -239,16 +239,15 @@ class StreamSession:
             resolve_ack_request(message.ack, self._dependencies.ack),
             datetime.now().astimezone(),
         )
-        plan = self._plan_phrasing(rule.phrasing)
-        lease = (
-            PredictorRefusal("unavailable")
-            if plan is None
-            else await self._pool_for(rule.timing).acquire()
-        )
-        if isinstance(lease, LeasedPredictor) and plan is not None:
-            utterance.backchannel = _BackchannelRun(
-                self._start_backchannel(utterance, lease, rule, plan), rule
+        pacing = create_pacing(rule.timing, rule.interval)
+        emitter = self._emitter_for(utterance, rule, pacing)
+        pool = self._pool_for(rule.timing)
+        lease = PredictorRefusal("unavailable") if emitter is None else await pool.acquire()
+        if isinstance(lease, LeasedPredictor) and emitter is not None:
+            stream = BackchannelStream(
+                utterance_id, lease.predictor, create_trigger(rule.timing, pacing), pool, emitter
             )
+            utterance.backchannel = _BackchannelRun(stream, rule)
         self._current = utterance
         await self._sender.send(
             StartedEvent(
@@ -266,45 +265,31 @@ class StreamSession:
             return self._dependencies.backchannel_pool
         return self._dependencies.silence_pool
 
-    def _plan_phrasing(
-        self, phrasing: RotationPhrasing | KindPhrasing
-    ) -> RotationPhrasing | _KindPlan | None:
-        """文言の決め方を決める。話の種類で選ぶ指定なのに判定を使えないときは None を返す。"""
-        if isinstance(phrasing, RotationPhrasing):
-            return phrasing
-        if self._dependencies.kind_judging is None:
-            return None
-        return _KindPlan(phrasing, self._dependencies.kind_judging)
-
-    def _start_backchannel(
-        self,
-        utterance: _ReceivingUtterance,
-        lease: LeasedPredictor,
-        rule: BackchannelRule,
-        plan: RotationPhrasing | _KindPlan,
-    ) -> BackchannelStream:
-        """借りた予測器で、この発話の相槌の予測を始める。"""
-        return BackchannelStream(
-            utterance.utterance_id,
-            lease.predictor,
-            create_trigger(rule.timing, rule.interval),
-            self._pool_for(rule.timing),
-            self._emitter_for(utterance, plan),
-        )
-
     def _emitter_for(
-        self, utterance: _ReceivingUtterance, plan: RotationPhrasing | _KindPlan
-    ) -> BackchannelEmitter:
-        """文言を順に回すか、話の種類で選ぶかに応じた emitter を作る。"""
-        if isinstance(plan, RotationPhrasing):
-            return RotationEmitter(
-                utterance.utterance_id, self._rotation_for(plan.phrases), self._sender
-            )
-        return KindEmitter(
-            KindTarget(utterance.utterance_id, utterance.language, utterance.samples_until),
-            self._kind_rotations_for(plan.phrasing),
-            plan.judging,
-            self._sender,
+        self, utterance: _ReceivingUtterance, rule: BackchannelRule, pacing: BackchannelPacing
+    ) -> BackchannelEmitter | None:
+        """途中の文字起こしで判定するか、文言を順に回すだけかに応じた emitter を作る。
+
+        判定するのは、文言を話の種類で選ぶときと、言い終わりの区切りを判定するとき。
+        話の種類で選ぶ指定なのに判定を使えないときは None を返す。
+        """
+        judging = self._dependencies.speech_judging
+        phrasing = rule.phrasing
+        delivery = BackchannelDelivery(self._sender, pacing)
+        if isinstance(phrasing, RotationPhrasing):
+            rotation = self._rotation_for(phrasing.phrases)
+            if judging is None or judging.boundary_judge is None or rule.boundary_threshold <= 0:
+                return RotationEmitter(utterance.utterance_id, rotation, delivery)
+            phrases: PhraseSource = rotation
+        elif judging is None or judging.kind_judge is None:
+            return None
+        else:
+            phrases = self._kind_rotations_for(phrasing)
+        return JudgingEmitter(
+            JudgedUtterance(utterance.utterance_id, utterance.language, utterance.samples_until),
+            JudgingRule(phrases, rule.boundary_threshold),
+            judging,
+            delivery,
             self._track,
         )
 
@@ -369,8 +354,8 @@ class StreamSession:
     async def _record(
         self, recorder: UtteranceRecorder, utterance: _ReceivingUtterance, run: _BackchannelRun
     ) -> None:
-        """予測のタスクが残りの音声を処理し終えるのを待ち、発話の音声と確率を保存する。"""
-        await run.stream.task
+        """予測と候補の判定が終わるのを待ち、発話の音声と確率を保存する。"""
+        await run.stream.wait_for_decisions()
         samples = utterance.all_samples()
         await recorder.record(
             UtteranceRecording(
@@ -379,6 +364,7 @@ class StreamSession:
                 samples,
                 run.rule.timing,
                 run.rule.interval,
+                run.rule.boundary_threshold,
                 run.stream.trace(),
             )
         )

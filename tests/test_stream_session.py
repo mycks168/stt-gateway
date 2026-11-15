@@ -24,7 +24,7 @@ from stt_gateway.transcription import Transcription
 _ACK_SETTINGS = AckSettings(
     "http://ollama.test", "gemma4:e2b", 1000, 20, "ちょっと確認するね。", "30m"
 )
-_BACKCHANNEL_SETTINGS = BackchannelSettings(1, "maai", 0.5, 120, 0, 0, 1.0, 0, ("うん",))
+_BACKCHANNEL_SETTINGS = BackchannelSettings(1, "maai", 0.5, 120, 0, 0, 0, 1.0, 0, 0.0, ("うん",))
 _ONE_FRAME_PCM = samples_to_pcm_s16le(np.zeros(1600, dtype=np.float32))
 
 
@@ -106,7 +106,7 @@ def _session(
         max_utterance_seconds=60,
         backchannel=_BACKCHANNEL_SETTINGS,
         ack=_ACK_SETTINGS,
-        kind_judging=None,
+        speech_judging=None,
     )
     return StreamSession(dependencies, sender)
 

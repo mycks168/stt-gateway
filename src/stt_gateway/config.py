@@ -77,6 +77,19 @@ def _read_interval_factor() -> float:
     return value
 
 
+def _read_boundary_threshold() -> float:
+    """相槌を送る区切りらしさの下限を読む。0 なら区切りを判定しない。"""
+    name = "STT_BACKCHANNEL_BOUNDARY_THRESHOLD"
+    raw = os.getenv(name, "0.35")
+    try:
+        value = float(raw)
+    except ValueError as error:
+        raise ValueError(f"invalid {name}: '{raw}' (must be a number)") from error
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"invalid {name}: '{raw}' (must be between 0 and 1)")
+    return value
+
+
 def _read_non_empty(name: str, default: str) -> str:
     """空にできない文字列の環境変数を読む。"""
     value = os.getenv(name, default).strip()
@@ -113,10 +126,12 @@ class BackchannelSettings:
     timing: BackchannelTimingName
     threshold: float
     silence_ms: int
+    min_new_speech_ms: int
     min_interval_ms: int
     interval_per_minute_ms: int
     interval_factor: float
     max_interval_ms: int
+    boundary_threshold: float
     phrases: tuple[str, ...]
 
 
@@ -152,12 +167,14 @@ def load_backchannel_settings() -> BackchannelSettings:
         silence_ms=_read_int(
             "STT_BACKCHANNEL_SILENCE_MS", "90", minimum=MIN_BACKCHANNEL_SILENCE_MS
         ),
+        min_new_speech_ms=_read_int("STT_BACKCHANNEL_MIN_NEW_SPEECH_MS", "1000", minimum=0),
         min_interval_ms=_read_int("STT_BACKCHANNEL_MIN_INTERVAL_MS", "1500", minimum=0),
         interval_per_minute_ms=_read_int(
             "STT_BACKCHANNEL_INTERVAL_PER_MINUTE_MS", "3000", minimum=0
         ),
         interval_factor=_read_interval_factor(),
         max_interval_ms=_read_int("STT_BACKCHANNEL_MAX_INTERVAL_MS", "8000", minimum=0),
+        boundary_threshold=_read_boundary_threshold(),
         phrases=parse_phrases(
             "STT_BACKCHANNEL_PHRASES",
             os.getenv("STT_BACKCHANNEL_PHRASES", DEFAULT_BACKCHANNEL_PHRASES),
@@ -220,6 +237,7 @@ class Settings:
     backchannel_judge: BackchannelJudgeSettings = field(
         default_factory=load_backchannel_judge_settings
     )
+    backchannel_boundary_model: str = os.getenv("STT_BACKCHANNEL_BOUNDARY_MODEL", "").strip()
     ack: AckSettings = field(default_factory=load_ack_settings)
     stream_recording_dir: Path | None = field(default_factory=load_stream_recording_dir)
 

@@ -86,6 +86,7 @@ _TEST_SETTING_CHANGES: dict[str, Any] = {
     "api_key": "",
     "language": "ja",
     "backchannel_judge": BackchannelJudgeSettings("", Path("/nonexistent"), 200),
+    "backchannel_boundary_model": "",
     "stream_recording_dir": None,
 }
 _KEV_URL = "http://kev.test:8009"
@@ -237,7 +238,9 @@ def test_stream_uses_silence_timing_when_requested(monkeypatch: pytest.MonkeyPat
         client.websocket_connect("/stream", headers=_AUTH_HEADERS) as websocket,
     ):
         _start(
-            websocket, encoding="pcm_s16le", backchannel={"timing": "silence", "silence_ms": 100}
+            websocket,
+            encoding="pcm_s16le",
+            backchannel={"timing": "silence", "silence_ms": 100, "min_new_speech_ms": 0},
         )
         websocket.send_bytes(_pcm(0.2))
         backchannel = websocket.receive_json()
@@ -544,7 +547,7 @@ def test_stream_sends_backchannel_judged_in_advance(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    caplog.set_level("INFO", logger="stt_gateway.backchannel_stream")
+    caplog.set_level("INFO", logger="stt_gateway.backchannel_emitters")
     _enable_kind_judge(monkeypatch, tmp_path)
     # 0.4 で準備（既定のしきい値 0.5 の 2/3 以上）、次の 0.9 で相槌を出す。
     monkeypatch.setattr(server, "create_maai_predictor", lambda: _ScriptedPredictor([0.4, 0.9]))
@@ -567,7 +570,7 @@ def test_stream_skips_backchannel_for_unmapped_kind_or_timeout(
     case: tuple[str, float],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    caplog.set_level("INFO", logger="stt_gateway.backchannel_stream")
+    caplog.set_level("INFO", logger="stt_gateway")
     kind, delay_seconds = case
     _enable_kind_judge(monkeypatch, tmp_path, timeout_ms=50)
     transcriber.kev_kind = kind
@@ -644,3 +647,86 @@ def test_stream_rotates_phrases_within_kind_across_utterances(
             assert websocket.receive_json()["type"] == "transcript"
             assert websocket.receive_json()["type"] == "ack"
     assert texts == ["うん", "うんうん"], "同じ種類の文言は、発話をまたいで順に使う"
+
+
+def _boundary_stream_events(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    recording_dir: Path,
+    boundary_probability: float | None,
+) -> tuple[list[str], dict[str, Any]]:
+    """区切りの判定を有効にして 1 発話を流し、届いたイベントの種類と録音の JSON を返す。
+
+    boundary_probability が None なら、モデルの読み込みに失敗させる。
+    """
+
+    def load(model_name: str) -> Callable[[str], float]:
+        """決まった区切りらしさを返すダミーのモデルを読み込む。"""
+        assert model_name == "test/boundary-model"
+        if boundary_probability is None:
+            raise RuntimeError("model files are missing")
+        return lambda _text: boundary_probability
+
+    caplog.set_level("INFO", logger="stt_gateway")
+    _patch_settings(
+        monkeypatch,
+        backchannel_boundary_model="test/boundary-model",
+        stream_recording_dir=recording_dir,
+    )
+    monkeypatch.setattr(server, "load_break_probability_model", load)
+    event_types: list[str] = []
+    with (
+        TestClient(server.app) as client,
+        client.websocket_connect("/stream", headers=_AUTH_HEADERS) as websocket,
+    ):
+        _start(websocket, encoding="pcm_s16le", backchannel={"boundary_threshold": 0.35})
+        websocket.send_bytes(_pcm(0.2))
+        if boundary_probability is None:
+            # 判定を使えないときは、文言を順に回すだけなので判定のログは出ない。
+            event_types.append(websocket.receive_json()["type"])
+        else:
+            _wait_until(lambda: "backchannel decision" in caplog.text)
+        websocket.send_json({"type": "end"})
+        while not event_types or event_types[-1] != "ack":
+            event_types.append(websocket.receive_json()["type"])
+        _wait_until(lambda: len(list(recording_dir.glob("*.json"))) == 1)
+    [json_path] = recording_dir.glob("*-u1.json")
+    document: dict[str, Any] = json.loads(json_path.read_text(encoding="utf-8"))
+    return event_types, document
+
+
+@pytest.mark.usefixtures("transcriber")
+def test_stream_stays_silent_when_speaker_is_mid_phrase(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    event_types, document = _boundary_stream_events(monkeypatch, caplog, tmp_path, 0.1)
+    assert event_types == ["transcript", "ack"], "言いかけの途中では相槌を出さない"
+    assert document["boundary_threshold"] == 0.35
+    assert document["decisions"] == [
+        {
+            "offset_ms": 200,
+            "reason": "not_boundary",
+            "text": "明日の天気は？",
+            "boundary_probability": 0.1,
+            "kind": None,
+        }
+    ]
+
+
+@pytest.mark.usefixtures("transcriber")
+def test_stream_sends_backchannel_at_phrase_boundary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    event_types, document = _boundary_stream_events(monkeypatch, caplog, tmp_path, 0.9)
+    assert event_types == ["backchannel", "transcript", "ack"]
+    assert [decision["reason"] for decision in document["decisions"]] == ["sent"]
+
+
+@pytest.mark.usefixtures("transcriber")
+def test_stream_sends_backchannel_when_boundary_model_cannot_be_loaded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    event_types, document = _boundary_stream_events(monkeypatch, caplog, tmp_path, None)
+    assert event_types == ["backchannel", "transcript", "ack"], "区切りを判定しないだけで相槌は出す"
+    assert document["decisions"] == []
+    assert "backchannel boundary judge is disabled (model=test/boundary-model)" in caplog.text

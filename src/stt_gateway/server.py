@@ -27,10 +27,12 @@ from pydantic import BaseModel
 
 from .ack_generator import AckGenerator
 from .auth import is_token_accepted
+from .backchannel_emitters import SpeechJudging
 from .backchannel_judge import BackchannelKindJudge, read_judge_token
 from .backchannel_pool import BackchannelPool
-from .backchannel_stream import KindJudging
 from .backends import describe_backend, load_transcriber
+from .boundary_judge import BoundaryJudge
+from .causal_lm_boundary import load_break_probability_model
 from .config import settings
 from .formats import UnsupportedAudioFormat, resolve_suffix
 from .maai_backchannel import create_maai_predictor
@@ -57,9 +59,7 @@ def create_http_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=None)
 
 
-def build_kind_judging(
-    serial_transcriber: SerialTranscriber, client: httpx.AsyncClient
-) -> KindJudging | None:
+def build_kind_judge(client: httpx.AsyncClient) -> BackchannelKindJudge | None:
     """話の種類の判定（Kev）を用意する。URL が空、またはトークンを読めなければ None を返す。"""
     judge_settings = settings.backchannel_judge
     if not judge_settings.url:
@@ -69,8 +69,35 @@ def build_kind_judging(
     except ValueError:
         logger.exception("backchannel kind judge is disabled (url=%s)", judge_settings.url)
         return None
-    judge = BackchannelKindJudge(judge_settings.url, token, client)
-    return KindJudging(judge, serial_transcriber, judge_settings.timeout_ms)
+    return BackchannelKindJudge(judge_settings.url, token, client)
+
+
+def build_boundary_judge() -> BoundaryJudge | None:
+    """言い終わりの区切りの判定を用意する。モデルが未指定、または読み込めなければ None を返す。
+
+    読み込めなくても起動は続ける。区切りを判定しないだけで、相槌は出せるため。
+    """
+    model_name = settings.backchannel_boundary_model
+    if not model_name:
+        return None
+    try:
+        return BoundaryJudge(load_break_probability_model(model_name))
+    except Exception:
+        logger.exception("backchannel boundary judge is disabled (model=%s)", model_name)
+        return None
+
+
+def build_speech_judging(
+    serial_transcriber: SerialTranscriber, client: httpx.AsyncClient
+) -> SpeechJudging | None:
+    """途中の文字起こしで相槌を判定する部品を用意する。使える判定が 1 つも無ければ None を返す。"""
+    kind_judge = build_kind_judge(client)
+    boundary_judge = build_boundary_judge()
+    if kind_judge is None and boundary_judge is None:
+        return None
+    return SpeechJudging(
+        serial_transcriber, settings.backchannel_judge.timeout_ms, kind_judge, boundary_judge
+    )
 
 
 def build_stream_dependencies(
@@ -87,7 +114,7 @@ def build_stream_dependencies(
         max_utterance_seconds=settings.stream_max_utterance_seconds,
         backchannel=settings.backchannel,
         ack=settings.ack,
-        kind_judging=build_kind_judging(serial_transcriber, client),
+        speech_judging=build_speech_judging(serial_transcriber, client),
         recorder=None
         if settings.stream_recording_dir is None
         else UtteranceRecorder(settings.stream_recording_dir),

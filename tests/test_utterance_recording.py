@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from stt_gateway.backchannel_interval import BackchannelInterval
-from stt_gateway.backchannel_policy import BackchannelFire, BackchannelFrame
+from stt_gateway.backchannel_policy import BackchannelDecision, BackchannelFire, BackchannelFrame
 from stt_gateway.backchannel_triggers import ProbabilityTiming, SilenceTiming
 from stt_gateway.stream_messages import UtteranceId
 from stt_gateway.utterance_recording import (
@@ -33,7 +33,13 @@ def _recording() -> UtteranceRecording:
         np.zeros(4800, dtype=np.float32),
         ProbabilityTiming(0.6),
         BackchannelInterval(1500, 3000, 1.1, 8000),
-        BackchannelTrace(frames, (frames[1],), (BackchannelFire(frames[2], True),)),
+        0.35,
+        BackchannelTrace(
+            frames,
+            (frames[1],),
+            (BackchannelFire(frames[2], True),),
+            (BackchannelDecision(300, "not_boundary", "あのさ、なので", 0.12, None),),
+        ),
     )
 
 
@@ -46,12 +52,23 @@ def test_recording_document_lists_frames_and_signals() -> None:
     assert document["prepare_threshold"] == pytest.approx(0.4)
     assert document["prepares"] == [{"offset_ms": 200, "probability": 0.4}]
     assert document["fires"] == [{"offset_ms": 300, "probability": 0.7, "has_prepared": True}]
+    assert document["boundary_threshold"] == 0.35
+    assert document["decisions"] == [
+        {
+            "offset_ms": 300,
+            "reason": "not_boundary",
+            "text": "あのさ、なので",
+            "boundary_probability": 0.12,
+            "kind": None,
+        }
+    ]
 
 
 def test_recording_document_for_silence_timing() -> None:
-    recording = dataclasses.replace(_recording(), timing=SilenceTiming(120))
+    recording = dataclasses.replace(_recording(), timing=SilenceTiming(120, 1000))
     document = recording_document(recording)
     assert (document["timing"], document["silence_ms"]) == ("silence", 120)
+    assert document["min_new_speech_ms"] == 1000
     assert "threshold" not in document
 
 

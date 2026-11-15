@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 from dataclasses import dataclass
@@ -11,7 +12,7 @@ from pathlib import Path
 
 from .audio_decoding import AudioSamples
 from .backchannel_interval import BackchannelInterval
-from .backchannel_policy import BackchannelFire, BackchannelFrame
+from .backchannel_policy import BackchannelDecision, BackchannelFire, BackchannelFrame
 from .backchannel_triggers import (
     PREPARE_THRESHOLD_RATIO,
     BackchannelTiming,
@@ -31,7 +32,7 @@ RECORDING_FILE_MODE = 0o600
 
 @dataclass(frozen=True)
 class BackchannelTrace:
-    """1 つの発話で予測した確率と、相槌の準備・発火の合図。
+    """1 つの発話で予測した確率と、相槌の準備・発火の合図、途中の文字起こしで判定した候補の結果。
 
     確率は、timing が maai なら相槌を打つべき確率、silence なら話していない確率。
     """
@@ -39,6 +40,7 @@ class BackchannelTrace:
     frames: tuple[BackchannelFrame, ...]
     prepares: tuple[BackchannelFrame, ...]
     fires: tuple[BackchannelFire, ...]
+    decisions: tuple[BackchannelDecision, ...]
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,7 @@ class UtteranceRecording:
     samples: AudioSamples
     timing: BackchannelTiming
     interval: BackchannelInterval
+    boundary_threshold: float
     trace: BackchannelTrace
 
 
@@ -66,12 +69,14 @@ def recording_document(recording: UtteranceRecording) -> dict[str, object]:
         "interval_per_minute_ms": recording.interval.per_minute_ms,
         "interval_factor": recording.interval.factor,
         "max_interval_ms": recording.interval.max_interval_ms,
+        "boundary_threshold": recording.boundary_threshold,
         "frames": [_frame_document(frame) for frame in trace.frames],
         "prepares": [_frame_document(frame) for frame in trace.prepares],
         "fires": [
             {**_frame_document(fire.frame), "has_prepared": fire.has_prepared}
             for fire in trace.fires
         ],
+        "decisions": [dataclasses.asdict(decision) for decision in trace.decisions],
     }
 
 
@@ -83,7 +88,11 @@ def _timing_document(timing: BackchannelTiming) -> dict[str, object]:
             "threshold": timing.threshold,
             "prepare_threshold": timing.threshold * PREPARE_THRESHOLD_RATIO,
         }
-    return {"timing": "silence", "silence_ms": timing.silence_ms}
+    return {
+        "timing": "silence",
+        "silence_ms": timing.silence_ms,
+        "min_new_speech_ms": timing.min_new_speech_ms,
+    }
 
 
 def _frame_document(frame: BackchannelFrame) -> dict[str, object]:

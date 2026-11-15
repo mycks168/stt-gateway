@@ -97,6 +97,26 @@ class BackchannelFire:
 
 BackchannelSignal = BackchannelPrepare | BackchannelFire
 
+# 相槌の候補をどうしたか。sent 以外は送らなかった理由。
+BackchannelDecisionReason = Literal[
+    "sent", "timeout", "not_boundary", "judge_unavailable", "unmapped_kind", "closed"
+]
+
+
+@dataclass(frozen=True)
+class BackchannelDecision:
+    """途中の文字起こしで判定した相槌の候補 1 つの結果。
+
+    text はその時点までの文字起こし、boundary_probability は言い終わりの区切りらしさ。
+    判定が間に合わなかった・使えなかった項目は None。
+    """
+
+    offset_ms: int
+    reason: BackchannelDecisionReason
+    text: str | None
+    boundary_probability: float | None
+    kind: BackchannelKind | None
+
 
 class BackchannelTrigger(Protocol):
     """フレームの予測を順に受け取り、準備や相槌の合図を出す。1 つの発話の中で状態を持つ。"""

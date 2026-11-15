@@ -53,6 +53,8 @@ MAX_BACKCHANNEL_PHRASE_CHARS = 20
 MAX_BACKCHANNEL_MIN_INTERVAL_MS = 60000
 # 無音を長く待つほど、相槌が話の続きにかぶる。
 MAX_BACKCHANNEL_SILENCE_MS = 2000
+# 相槌の前に新しく話しているべき長さの上限。これ以上は、相槌がほぼ出なくなる。
+MAX_BACKCHANNEL_MIN_NEW_SPEECH_MS = 10000
 MAX_PHRASES_PER_KIND = 5
 
 
@@ -105,6 +107,9 @@ class BackchannelOptions(_StrictOptions):
     silence_ms: (
         Annotated[int, Field(ge=MIN_BACKCHANNEL_SILENCE_MS, le=MAX_BACKCHANNEL_SILENCE_MS)] | None
     ) = None
+    min_new_speech_ms: Annotated[int, Field(ge=0, le=MAX_BACKCHANNEL_MIN_NEW_SPEECH_MS)] | None = (
+        None
+    )
     min_interval_ms: Annotated[int, Field(ge=0, le=MAX_BACKCHANNEL_MIN_INTERVAL_MS)] | None = None
     interval_per_minute_ms: (
         Annotated[int, Field(ge=0, le=MAX_BACKCHANNEL_MIN_INTERVAL_MS)] | None
@@ -117,6 +122,7 @@ class BackchannelOptions(_StrictOptions):
         | None
     ) = None
     max_interval_ms: Annotated[int, Field(ge=0, le=MAX_BACKCHANNEL_MIN_INTERVAL_MS)] | None = None
+    boundary_threshold: Annotated[float, Field(ge=0.0, le=1.0)] | None = None
     phrases_by_kind: (
         Annotated[
             dict[BackchannelKind, _BackchannelPhrase | _KindPhraseList],

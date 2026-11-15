@@ -1,4 +1,4 @@
-"""相槌どうしの最短の間隔を、発話の経過時間と相槌の回数に合わせて伸ばす。
+"""次の相槌を出してよいかを、送った相槌からの間隔と、新しく話した長さで決める。
 
 人は相手の話が長くなるほど相槌を減らすため、話し始めは min_interval_ms で打ち、
 話が続くほど・相槌を重ねるほど間隔を空ける。
@@ -59,3 +59,47 @@ class IntervalGate:
         """相槌を出したことを記録する。"""
         self._last_fired_offset_ms = offset_ms
         self._fired_count += 1
+
+
+class BackchannelPacing:
+    """1 つの発話の中で、次の相槌の候補を出してよいかを判定する。
+
+    次のどれかに当たる間は出さない。
+    - 送った相槌からの間隔が足りない。
+    - 送った相槌（無ければ発話の先頭）から新しく話した長さが min_new_speech_ms に足りない。
+      同じ言葉のまま間が空いただけの場所で、もう一度相槌を打たないため。
+    - 前の候補を送るかどうかが、まだ決まっていない。
+    間隔と話した長さは、送った相槌からだけ数え直す。送らなかった候補で数え直すと、
+    言いかけで黙った直後の区切りで相槌を出せなくなるため。
+    """
+
+    def __init__(self, interval: BackchannelInterval, min_new_speech_ms: int) -> None:
+        """間隔の決め方と、相槌の前に新しく話しているべき長さを受け取る。"""
+        self._gate = IntervalGate(interval)
+        self._min_new_speech_ms = min_new_speech_ms
+        self._new_speech_ms = 0
+        self._is_held = False
+
+    def add_speech(self, duration_ms: int) -> None:
+        """話していた長さを足す。"""
+        self._new_speech_ms += duration_ms
+
+    def is_closed(self, offset_ms: int) -> bool:
+        """offset_ms では候補を出せないかを返す。"""
+        return (
+            self._is_held
+            or self._new_speech_ms < self._min_new_speech_ms
+            or self._gate.is_closed(offset_ms)
+        )
+
+    def hold(self) -> None:
+        """候補を出した。送るかどうかが決まるまで、次の候補を出さない。"""
+        self._is_held = True
+
+    def settle(self, sent_offset_ms: int | None) -> None:
+        """候補の結果が決まった。送ったなら、その位置から間隔と話した長さを数え直す。"""
+        self._is_held = False
+        if sent_offset_ms is None:
+            return
+        self._gate.record_fire(sent_offset_ms)
+        self._new_speech_ms = 0

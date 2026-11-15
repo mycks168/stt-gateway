@@ -56,10 +56,13 @@ ollama pull gemma4:e2b
 | `STT_BACKCHANNEL_TIMING` | `maai` | 相槌のタイミングの決め方（`maai` / `silence`）。`start` で発話ごとに変えられる |
 | `STT_BACKCHANNEL_THRESHOLD` | `0.5` | 相槌を出す確率のしきい値（0 より大きく 1 以下）。小さいほど相槌が増える |
 | `STT_BACKCHANNEL_SILENCE_MS` | `90` | `timing` が `silence` のとき、相槌を出すまでに待つ無音の長さ（ミリ秒、32 以上） |
+| `STT_BACKCHANNEL_MIN_NEW_SPEECH_MS` | `1000` | `timing` が `silence` のとき、前の相槌（無ければ話し始め）から新しくこの長さ（ミリ秒）話すまで相槌を出さない |
 | `STT_BACKCHANNEL_MIN_INTERVAL_MS` | `1500` | 話し始めの、相槌と相槌の最短の間隔（ミリ秒） |
 | `STT_BACKCHANNEL_INTERVAL_PER_MINUTE_MS` | `3000` | 1 分話すごとに最短の間隔へ足す長さ（ミリ秒） |
 | `STT_BACKCHANNEL_INTERVAL_FACTOR` | `1.1` | 相槌を 1 回出すごとに最短の間隔を何倍にするか（1.0〜3.0） |
 | `STT_BACKCHANNEL_MAX_INTERVAL_MS` | `8000` | 伸ばした最短の間隔の上限（ミリ秒） |
+| `STT_BACKCHANNEL_BOUNDARY_MODEL` | (空) | 言いかけの途中で相槌を出さないために使う言語モデル（Hugging Face のモデル名か、モデルのディレクトリ）。空なら判定しない。extras `haas` が必要 |
+| `STT_BACKCHANNEL_BOUNDARY_THRESHOLD` | `0.35` | 相槌を出す「言い終わりの区切りらしさ」の下限（0〜1）。大きいほど相槌が減る。`0` で判定しない |
 | `STT_BACKCHANNEL_PHRASES` | `うん,うんうん,はい,なるほど` | 相槌の文言（カンマ区切り）。順に使う |
 | `STT_ACK_OLLAMA_URL` | `http://127.0.0.1:11434` | 一時的な返事を作る Ollama の URL |
 | `STT_ACK_MODEL` | `gemma4:e2b` | 一時的な返事を作る Ollama のモデル |
@@ -129,6 +132,15 @@ STT_BACKCHANNEL_JUDGE_URL=http://127.0.0.1:8009
 STT_BACKCHANNEL_JUDGE_TOKEN_FILE=/home/yuki/.config/kev/api_key
 STT_BACKCHANNEL_JUDGE_TIMEOUT_MS=200
 ```
+
+言いかけの途中で相槌を出さないようにするには、`.env` に言語モデルを設定して gateway を再起動する
+（`uv sync --extra haas` が必要。GPU を約 1.5GB 使う）。モデルは、gateway の実行ユーザーが
+読める場所を指定する。Hugging Face のモデル名を指定すると、最初の起動でダウンロードする。
+
+```dotenv
+STT_BACKCHANNEL_BOUNDARY_MODEL=Qwen/Qwen3.5-0.8B-Base
+```
+
 
 ```bash
 sudo systemctl restart stt-gateway
@@ -252,10 +264,12 @@ curl -X POST http://127.0.0.1:23000/transcribe \
 | `backchannel.timing` | `maai` / `silence` | `STT_BACKCHANNEL_TIMING` |
 | `backchannel.threshold` | 0 より大きく 1 以下（`timing` が `maai` のときだけ使う） | `STT_BACKCHANNEL_THRESHOLD` |
 | `backchannel.silence_ms` | 32〜2,000（`timing` が `silence` のときだけ使う） | `STT_BACKCHANNEL_SILENCE_MS` |
+| `backchannel.min_new_speech_ms` | 0〜10,000（`timing` が `silence` のときだけ使う） | `STT_BACKCHANNEL_MIN_NEW_SPEECH_MS` |
 | `backchannel.min_interval_ms` | 0〜60,000 | `STT_BACKCHANNEL_MIN_INTERVAL_MS` |
 | `backchannel.interval_per_minute_ms` | 0〜60,000 | `STT_BACKCHANNEL_INTERVAL_PER_MINUTE_MS` |
 | `backchannel.interval_factor` | 1.0〜3.0 | `STT_BACKCHANNEL_INTERVAL_FACTOR` |
 | `backchannel.max_interval_ms` | 0〜60,000 | `STT_BACKCHANNEL_MAX_INTERVAL_MS` |
+| `backchannel.boundary_threshold` | 0〜1 | `STT_BACKCHANNEL_BOUNDARY_THRESHOLD` |
 
 - `backchannel.timing` は相槌を打つタイミングの決め方。`maai` は相槌の予測モデル（MaAI）の確率が
   `threshold` を超えたところ、`silence` は話していない状態（Silero VAD で判定）が `silence_ms`
@@ -266,6 +280,12 @@ curl -X POST http://127.0.0.1:23000/transcribe \
   `interval_per_minute_ms` 足す）・相槌を重ねるほど（1 回ごとに `interval_factor` 倍）広げる。
   広げた間隔は `max_interval_ms` を超えない（`min_interval_ms` より小さい場合は `min_interval_ms`）。
   広げないときは `interval_per_minute_ms` を 0、`interval_factor` を 1.0 にする。
+  間隔は送った相槌から数える。出さなかった相槌（下の区切りの判定で黙ったものなど）では数え直さない。
+- `STT_BACKCHANNEL_BOUNDARY_MODEL` を設定したサーバでは、話し手が言いかけの途中（「なので」
+  「〜の方で」など）で止まったところでは相槌を出さない。途中までの文字起こしの「言い終わりの
+  区切りらしさ」が `boundary_threshold` より小さいと出さない。`0` を指定した発話では判定しない。
+- `timing` が `silence` の発話では、前の相槌（無ければ話し始め）から新しく `min_new_speech_ms`
+  話すまで相槌を出さない。同じ言葉のまま間が空いただけのところで、もう一度出さないため。
 - `"ack": false` にすると、その発話では一時的な返事が届かない。
 - 範囲外の値や知らないフィールドがあると `invalid_message` が届き、その発話は始まらない。
 - 一時的な返事を作るモデルは、クライアントからは変えられない（`STT_ACK_MODEL`）。
@@ -305,9 +325,9 @@ Kev の接続先が未設定、またはトークンが読めない場合は、`
 種類は途中までの文字起こしのうち、最後の文を使って判定する。
 `opinion` には「なるほど」より「うん」が合うことが多い（「〜な気がするな」もここに入る）。
 起動スクリプトを使うと、種類別相槌の送信・見送り理由が INFO ログに残る。
-`reason=sent` は送信、`unmapped_kind` は文言の指定がない種類、`timeout` は時間切れ、
-`judge_unavailable` は判定結果なし、`closed` は発話終了後を表す。
-音声位置・種類・判定の所要時間も記録し、発話本文とトークンは記録しない。
+`reason=sent` は送信、`not_boundary` は言いかけの途中、`unmapped_kind` は文言の指定がない種類、
+`timeout` は時間切れ、`judge_unavailable` は判定結果なし、`closed` は発話終了後を表す。
+音声位置・種類・区切りらしさ（`boundary`）・判定の所要時間も記録し、発話本文とトークンは記録しない。
 
 
 #### サーバから届くもの（テキスト・JSON）

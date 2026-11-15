@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from stt_gateway.backchannel_interval import BackchannelInterval, IntervalGate
+from stt_gateway.backchannel_interval import (
+    BackchannelInterval,
+    BackchannelPacing,
+    IntervalGate,
+)
 
 
 def test_interval_grows_with_elapsed_time() -> None:
@@ -38,3 +42,22 @@ def test_gate_measures_interval_at_candidate_position() -> None:
     # 候補の位置 t で必要な間隔は 1000 + 6000 × t / 60000（34.4 秒なら 4440ms、34.5 秒なら 4450ms）。
     assert gate.is_closed(34_400)
     assert not gate.is_closed(34_500)
+
+
+def test_pacing_counts_interval_and_speech_from_sent_backchannel() -> None:
+    pacing = BackchannelPacing(BackchannelInterval(1000, 0, 1.0, 1000), 300)
+    assert pacing.is_closed(0), "まだ話していない"
+    pacing.add_speech(300)
+    assert not pacing.is_closed(500)
+    pacing.hold()
+    assert pacing.is_closed(500), "送るかどうかが決まるまで閉じる"
+    pacing.settle(None)
+    assert not pacing.is_closed(600), "送らなかった候補では数え直さない"
+    pacing.hold()
+    pacing.settle(600)
+    pacing.add_speech(300)
+    assert pacing.is_closed(1599), "送った位置から間隔を数える"
+    assert not pacing.is_closed(1600)
+    pacing.hold()
+    pacing.settle(1600)
+    assert pacing.is_closed(5000), "送った後に話していない"
