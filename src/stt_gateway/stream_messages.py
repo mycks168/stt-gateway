@@ -14,6 +14,10 @@ from pydantic import (
 )
 
 from .ack_generator import AckSource
+from .backchannel_interval import (
+    MAX_BACKCHANNEL_INTERVAL_FACTOR,
+    MIN_BACKCHANNEL_INTERVAL_FACTOR,
+)
 from .backchannel_policy import (
     BACKCHANNEL_KINDS,
     MIN_BACKCHANNEL_SILENCE_MS,
@@ -102,6 +106,17 @@ class BackchannelOptions(_StrictOptions):
         Annotated[int, Field(ge=MIN_BACKCHANNEL_SILENCE_MS, le=MAX_BACKCHANNEL_SILENCE_MS)] | None
     ) = None
     min_interval_ms: Annotated[int, Field(ge=0, le=MAX_BACKCHANNEL_MIN_INTERVAL_MS)] | None = None
+    interval_per_minute_ms: (
+        Annotated[int, Field(ge=0, le=MAX_BACKCHANNEL_MIN_INTERVAL_MS)] | None
+    ) = None
+    interval_factor: (
+        Annotated[
+            float,
+            Field(ge=MIN_BACKCHANNEL_INTERVAL_FACTOR, le=MAX_BACKCHANNEL_INTERVAL_FACTOR),
+        ]
+        | None
+    ) = None
+    max_interval_ms: Annotated[int, Field(ge=0, le=MAX_BACKCHANNEL_MIN_INTERVAL_MS)] | None = None
     phrases_by_kind: (
         Annotated[
             dict[BackchannelKind, _BackchannelPhrase | _KindPhraseList],

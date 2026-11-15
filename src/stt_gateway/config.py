@@ -9,6 +9,10 @@ from typing import get_args
 
 from dotenv import load_dotenv
 
+from .backchannel_interval import (
+    MAX_BACKCHANNEL_INTERVAL_FACTOR,
+    MIN_BACKCHANNEL_INTERVAL_FACTOR,
+)
 from .backchannel_policy import (
     BACKCHANNEL_TIMING_NAMES,
     MIN_BACKCHANNEL_SILENCE_MS,
@@ -60,6 +64,19 @@ def _read_float(
     return value
 
 
+def _read_interval_factor() -> float:
+    """相槌のたびに間隔を伸ばす倍率を読む。1 未満は間隔が縮むため受け付けない。"""
+    name = "STT_BACKCHANNEL_INTERVAL_FACTOR"
+    value = _read_float(
+        name, "1.1", lower_exclusive=0.0, upper_inclusive=MAX_BACKCHANNEL_INTERVAL_FACTOR
+    )
+    if value < MIN_BACKCHANNEL_INTERVAL_FACTOR:
+        raise ValueError(
+            f"invalid {name}: '{value}' (must be {MIN_BACKCHANNEL_INTERVAL_FACTOR} or more)"
+        )
+    return value
+
+
 def _read_non_empty(name: str, default: str) -> str:
     """空にできない文字列の環境変数を読む。"""
     value = os.getenv(name, default).strip()
@@ -97,6 +114,9 @@ class BackchannelSettings:
     threshold: float
     silence_ms: int
     min_interval_ms: int
+    interval_per_minute_ms: int
+    interval_factor: float
+    max_interval_ms: int
     phrases: tuple[str, ...]
 
 
@@ -133,6 +153,11 @@ def load_backchannel_settings() -> BackchannelSettings:
             "STT_BACKCHANNEL_SILENCE_MS", "90", minimum=MIN_BACKCHANNEL_SILENCE_MS
         ),
         min_interval_ms=_read_int("STT_BACKCHANNEL_MIN_INTERVAL_MS", "1500", minimum=0),
+        interval_per_minute_ms=_read_int(
+            "STT_BACKCHANNEL_INTERVAL_PER_MINUTE_MS", "3000", minimum=0
+        ),
+        interval_factor=_read_interval_factor(),
+        max_interval_ms=_read_int("STT_BACKCHANNEL_MAX_INTERVAL_MS", "8000", minimum=0),
         phrases=parse_phrases(
             "STT_BACKCHANNEL_PHRASES",
             os.getenv("STT_BACKCHANNEL_PHRASES", DEFAULT_BACKCHANNEL_PHRASES),

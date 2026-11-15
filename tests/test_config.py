@@ -35,6 +35,9 @@ _STREAM_ENV_NAMES = (
     "STT_BACKCHANNEL_THRESHOLD",
     "STT_BACKCHANNEL_SILENCE_MS",
     "STT_BACKCHANNEL_MIN_INTERVAL_MS",
+    "STT_BACKCHANNEL_INTERVAL_PER_MINUTE_MS",
+    "STT_BACKCHANNEL_INTERVAL_FACTOR",
+    "STT_BACKCHANNEL_MAX_INTERVAL_MS",
     "STT_BACKCHANNEL_PHRASES",
     "STT_ACK_OLLAMA_URL",
     "STT_ACK_MODEL",
@@ -64,6 +67,9 @@ def test_stream_settings_defaults() -> None:
         threshold=0.5,
         silence_ms=90,
         min_interval_ms=1500,
+        interval_per_minute_ms=3000,
+        interval_factor=1.1,
+        max_interval_ms=8000,
         phrases=("うん", "うんうん", "はい", "なるほど"),
     )
     assert ack.ollama_url == "http://127.0.0.1:11434"
@@ -163,7 +169,12 @@ def test_stream_recording_dir(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.parametrize(
     ("name", "value"),
-    [("STT_BACKCHANNEL_TIMING", "vad"), ("STT_BACKCHANNEL_SILENCE_MS", "31")],
+    [
+        ("STT_BACKCHANNEL_TIMING", "vad"),
+        ("STT_BACKCHANNEL_SILENCE_MS", "31"),
+        ("STT_BACKCHANNEL_INTERVAL_FACTOR", "0.9"),
+        ("STT_BACKCHANNEL_INTERVAL_FACTOR", "3.5"),
+    ],
 )
 def test_backchannel_settings_reject_invalid_timing(
     clean_stream_env: pytest.MonkeyPatch, name: str, value: str

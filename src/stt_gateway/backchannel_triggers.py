@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .backchannel_interval import BackchannelInterval, IntervalGate
 from .backchannel_policy import (
     BackchannelFire,
     BackchannelFrame,
@@ -23,20 +24,19 @@ class ProbabilityTrigger:
     """MaAI の確率がしきい値を下から上へ超えたフレームでだけ相槌を出す（timing が maai のとき）。
 
     しきい値を超えている間ずっと出すと、1 つの間に何度も相槌を打ってしまうため。
-    前の相槌から min_interval_ms 経つまでは出さない。予測は近い位置で続けて山を作ることがあるため。
+    前の相槌から interval の間隔が経つまでは出さない。予測は近い位置で続けて山を作ることがあるため。
     しきい値の PREPARE_THRESHOLD_RATIO 倍を超えたフレームでは、準備の合図を出す。
     文言は決めない（順に回すか、話の種類で選ぶかは呼び出し側が決める）。
     """
 
-    def __init__(self, threshold: float, min_interval_ms: int) -> None:
-        """しきい値と最短の間隔を受け取る。"""
+    def __init__(self, threshold: float, interval: BackchannelInterval) -> None:
+        """しきい値と、相槌どうしの間隔の決め方を受け取る。"""
         self._threshold = threshold
         self._prepare_threshold = threshold * PREPARE_THRESHOLD_RATIO
-        self._min_interval_ms = min_interval_ms
+        self._gate = IntervalGate(interval)
         self._was_above_threshold = False
         self._was_above_prepare_threshold = False
         self._has_prepared = False
-        self._last_fired_offset_ms: int | None = None
 
     def observe(self, frame: BackchannelFrame) -> BackchannelSignal | None:
         """フレームの予測を受け取り、準備を始めるか相槌を出すなら、その合図を返す。"""
@@ -51,7 +51,7 @@ class ProbabilityTrigger:
         if not is_above_prepare_threshold:
             # 山が終わったら、その山で始めた準備は次の山では使わない。
             self._has_prepared = False
-        if self._is_within_min_interval(frame.offset_ms):
+        if self._gate.is_closed(frame.offset_ms):
             return None
         if is_rising_edge:
             return self._fire(frame)
@@ -62,16 +62,10 @@ class ProbabilityTrigger:
 
     def _fire(self, frame: BackchannelFrame) -> BackchannelFire:
         """相槌を出す合図を作る。準備は 1 回の相槌でだけ使う。"""
-        self._last_fired_offset_ms = frame.offset_ms
+        self._gate.record_fire(frame.offset_ms)
         signal = BackchannelFire(frame, self._has_prepared)
         self._has_prepared = False
         return signal
-
-    def _is_within_min_interval(self, offset_ms: int) -> bool:
-        """前の相槌から最短の間隔が経っていないかを返す。"""
-        if self._last_fired_offset_ms is None:
-            return False
-        return offset_ms - self._last_fired_offset_ms < self._min_interval_ms
 
 
 class SilenceTrigger:
@@ -83,13 +77,12 @@ class SilenceTrigger:
     （クライアントが話し始めの前から送る音声）では、まだ何も話していないため出さない。
     """
 
-    def __init__(self, silence_ms: int, min_interval_ms: int) -> None:
-        """相槌を出すまで待つ無音の長さと、最短の間隔を受け取る。"""
+    def __init__(self, silence_ms: int, interval: BackchannelInterval) -> None:
+        """相槌を出すまで待つ無音の長さと、相槌どうしの間隔の決め方を受け取る。"""
         self._silence_ms = silence_ms
-        self._min_interval_ms = min_interval_ms
+        self._gate = IntervalGate(interval)
         self._last_speech_offset_ms: int | None = None
         self._has_prepared = False
-        self._last_fired_offset_ms: int | None = None
 
     def observe(self, frame: BackchannelFrame) -> BackchannelSignal | None:
         """フレームを受け取り、準備を始めるか相槌を出すなら、その合図を返す。"""
@@ -98,7 +91,7 @@ class SilenceTrigger:
             # 無音の途中で話し始めたら、その無音で始めた準備は使わない。
             self._has_prepared = False
             return None
-        if self._last_speech_offset_ms is None or self._is_within_min_interval(frame.offset_ms):
+        if self._last_speech_offset_ms is None or self._gate.is_closed(frame.offset_ms):
             return None
         if frame.offset_ms - self._last_speech_offset_ms >= self._silence_ms:
             return self._fire(frame)
@@ -110,16 +103,10 @@ class SilenceTrigger:
     def _fire(self, frame: BackchannelFrame) -> BackchannelFire:
         """相槌を出す合図を作り、話し手がまた話すまで次を出さない。"""
         signal = BackchannelFire(frame, self._has_prepared)
-        self._last_fired_offset_ms = frame.offset_ms
+        self._gate.record_fire(frame.offset_ms)
         self._last_speech_offset_ms = None
         self._has_prepared = False
         return signal
-
-    def _is_within_min_interval(self, offset_ms: int) -> bool:
-        """前の相槌から最短の間隔が経っていないかを返す。"""
-        if self._last_fired_offset_ms is None:
-            return False
-        return offset_ms - self._last_fired_offset_ms < self._min_interval_ms
 
 
 @dataclass(frozen=True)
@@ -139,8 +126,8 @@ class SilenceTiming:
 BackchannelTiming = ProbabilityTiming | SilenceTiming
 
 
-def create_trigger(timing: BackchannelTiming, min_interval_ms: int) -> BackchannelTrigger:
+def create_trigger(timing: BackchannelTiming, interval: BackchannelInterval) -> BackchannelTrigger:
     """タイミングの決め方に合うトリガーを作る。"""
     if isinstance(timing, ProbabilityTiming):
-        return ProbabilityTrigger(timing.threshold, min_interval_ms)
-    return SilenceTrigger(timing.silence_ms, min_interval_ms)
+        return ProbabilityTrigger(timing.threshold, interval)
+    return SilenceTrigger(timing.silence_ms, interval)

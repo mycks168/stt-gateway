@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from stt_gateway.backchannel_interval import BackchannelInterval
 from stt_gateway.backchannel_policy import BackchannelFire, BackchannelFrame
 from stt_gateway.backchannel_triggers import ProbabilityTiming, SilenceTiming
 from stt_gateway.stream_messages import UtteranceId
@@ -31,7 +32,7 @@ def _recording() -> UtteranceRecording:
         datetime(2026, 11, 15, 17, 30, 0, 123456, tzinfo=timezone.utc),
         np.zeros(4800, dtype=np.float32),
         ProbabilityTiming(0.6),
-        1500,
+        BackchannelInterval(1500, 3000, 1.1, 8000),
         BackchannelTrace(frames, (frames[1],), (BackchannelFire(frames[2], True),)),
     )
 
@@ -40,6 +41,7 @@ def test_recording_document_lists_frames_and_signals() -> None:
     document = recording_document(_recording())
     assert document["recorded_at"] == "2026-11-15T17:30:00.123456+00:00"
     assert document["timing"] == "maai"
+    assert (document["min_interval_ms"], document["interval_factor"]) == (1500, 1.1)
     assert document["duration_ms"] == 300
     assert document["prepare_threshold"] == pytest.approx(0.4)
     assert document["prepares"] == [{"offset_ms": 200, "probability": 0.4}]

@@ -90,7 +90,7 @@ class KindJudging:
 
 @dataclass(frozen=True)
 class KindTarget:
-    """話の種類を判定する発話。samples_until は発話の先頭から指定の位置までの音声を返す。"""
+    """話の種類を判定する発話。samples_until は指定の位置までの直近の音声を返す。"""
 
     utterance_id: UtteranceId
     language: str
@@ -331,10 +331,11 @@ class BackchannelStream:
             pass
 
 
-def samples_until_offset(chunks: list[AudioSamples], offset_ms: int) -> AudioSamples:
-    """受け取った音声の先頭から offset_ms までを 1 つの波形にする。"""
+def recent_samples(chunks: list[AudioSamples], end_ms: int, window_ms: int) -> AudioSamples:
+    """受け取った音声のうち、end_ms までの直近 window_ms を 1 つの波形にする。"""
     if not chunks:
         return np.zeros(0, dtype=np.float32)
-    end = offset_ms * STREAM_SAMPLE_RATE_HZ // MILLISECONDS_PER_SECOND
-    samples: AudioSamples = np.concatenate(chunks)[:end]
+    end = end_ms * STREAM_SAMPLE_RATE_HZ // MILLISECONDS_PER_SECOND
+    start = max(0, (end_ms - window_ms) * STREAM_SAMPLE_RATE_HZ // MILLISECONDS_PER_SECOND)
+    samples: AudioSamples = np.concatenate(chunks)[start:end]
     return samples

@@ -4,14 +4,17 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TypeVar
 
 from .ack_generator import AckRequest
 from .ack_prompt import DEFAULT_ACK_PROMPT, AckPrompt
+from .backchannel_interval import BackchannelInterval
 from .backchannel_policy import BackchannelKind
 from .backchannel_triggers import BackchannelTiming, ProbabilityTiming, SilenceTiming
 from .config import AckSettings, BackchannelSettings
 from .stream_messages import AckOptions, BackchannelOptions
+
+_Value = TypeVar("_Value", int, float)
 
 
 @dataclass(frozen=True)
@@ -33,7 +36,7 @@ class BackchannelRule:
     """1 つの発話で相槌を出す規則。"""
 
     timing: BackchannelTiming
-    min_interval_ms: int
+    interval: BackchannelInterval
     phrasing: RotationPhrasing | KindPhrasing
 
 
@@ -42,18 +45,31 @@ def resolve_backchannel_rule(
 ) -> BackchannelRule:
     """指定された項目はそのまま、省略された項目はサーバの設定を使う。"""
     if options is None:
-        return BackchannelRule(
-            _resolve_timing(BackchannelOptions(), defaults),
-            defaults.min_interval_ms,
-            RotationPhrasing(defaults.phrases),
-        )
+        options = BackchannelOptions()
     return BackchannelRule(
         timing=_resolve_timing(options, defaults),
-        min_interval_ms=(
-            defaults.min_interval_ms if options.min_interval_ms is None else options.min_interval_ms
-        ),
+        interval=_resolve_interval(options, defaults),
         phrasing=_resolve_phrasing(options, defaults),
     )
+
+
+def _resolve_interval(
+    options: BackchannelOptions, defaults: BackchannelSettings
+) -> BackchannelInterval:
+    """相槌どうしの間隔の決め方を、指定された項目とサーバの設定から決める。"""
+    return BackchannelInterval(
+        min_interval_ms=_given_or_default(options.min_interval_ms, defaults.min_interval_ms),
+        per_minute_ms=_given_or_default(
+            options.interval_per_minute_ms, defaults.interval_per_minute_ms
+        ),
+        factor=_given_or_default(options.interval_factor, defaults.interval_factor),
+        max_interval_ms=_given_or_default(options.max_interval_ms, defaults.max_interval_ms),
+    )
+
+
+def _given_or_default(given: _Value | None, default: _Value) -> _Value:
+    """指定された値があればそれを、無ければサーバの設定の値を返す。"""
+    return default if given is None else given
 
 
 def _resolve_timing(

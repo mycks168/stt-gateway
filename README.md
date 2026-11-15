@@ -56,7 +56,10 @@ ollama pull gemma4:e2b
 | `STT_BACKCHANNEL_TIMING` | `maai` | 相槌のタイミングの決め方（`maai` / `silence`）。`start` で発話ごとに変えられる |
 | `STT_BACKCHANNEL_THRESHOLD` | `0.5` | 相槌を出す確率のしきい値（0 より大きく 1 以下）。小さいほど相槌が増える |
 | `STT_BACKCHANNEL_SILENCE_MS` | `90` | `timing` が `silence` のとき、相槌を出すまでに待つ無音の長さ（ミリ秒、32 以上） |
-| `STT_BACKCHANNEL_MIN_INTERVAL_MS` | `1500` | 相槌と相槌の最短の間隔（ミリ秒） |
+| `STT_BACKCHANNEL_MIN_INTERVAL_MS` | `1500` | 話し始めの、相槌と相槌の最短の間隔（ミリ秒） |
+| `STT_BACKCHANNEL_INTERVAL_PER_MINUTE_MS` | `3000` | 1 分話すごとに最短の間隔へ足す長さ（ミリ秒） |
+| `STT_BACKCHANNEL_INTERVAL_FACTOR` | `1.1` | 相槌を 1 回出すごとに最短の間隔を何倍にするか（1.0〜3.0） |
+| `STT_BACKCHANNEL_MAX_INTERVAL_MS` | `8000` | 伸ばした最短の間隔の上限（ミリ秒） |
 | `STT_BACKCHANNEL_PHRASES` | `うん,うんうん,はい,なるほど` | 相槌の文言（カンマ区切り）。順に使う |
 | `STT_ACK_OLLAMA_URL` | `http://127.0.0.1:11434` | 一時的な返事を作る Ollama の URL |
 | `STT_ACK_MODEL` | `gemma4:e2b` | 一時的な返事を作る Ollama のモデル |
@@ -250,12 +253,19 @@ curl -X POST http://127.0.0.1:23000/transcribe \
 | `backchannel.threshold` | 0 より大きく 1 以下（`timing` が `maai` のときだけ使う） | `STT_BACKCHANNEL_THRESHOLD` |
 | `backchannel.silence_ms` | 32〜2,000（`timing` が `silence` のときだけ使う） | `STT_BACKCHANNEL_SILENCE_MS` |
 | `backchannel.min_interval_ms` | 0〜60,000 | `STT_BACKCHANNEL_MIN_INTERVAL_MS` |
+| `backchannel.interval_per_minute_ms` | 0〜60,000 | `STT_BACKCHANNEL_INTERVAL_PER_MINUTE_MS` |
+| `backchannel.interval_factor` | 1.0〜3.0 | `STT_BACKCHANNEL_INTERVAL_FACTOR` |
+| `backchannel.max_interval_ms` | 0〜60,000 | `STT_BACKCHANNEL_MAX_INTERVAL_MS` |
 
 - `backchannel.timing` は相槌を打つタイミングの決め方。`maai` は相槌の予測モデル（MaAI）の確率が
   `threshold` を超えたところ、`silence` は話していない状態（Silero VAD で判定）が `silence_ms`
   続いたところで相槌を出す。`silence` では、話し始める前の無音では相槌を出さず、1 つの切れ目では
   1 回だけ出す。`backchannel` イベントの `probability` は、`maai` では相槌を打つべき確率、
   `silence` では話していない確率になる。
+- 相槌と相槌の間は、話し始めは `min_interval_ms` 空け、話が続くほど（1 分ごとに
+  `interval_per_minute_ms` 足す）・相槌を重ねるほど（1 回ごとに `interval_factor` 倍）広げる。
+  広げた間隔は `max_interval_ms` を超えない（`min_interval_ms` より小さい場合は `min_interval_ms`）。
+  広げないときは `interval_per_minute_ms` を 0、`interval_factor` を 1.0 にする。
 - `"ack": false` にすると、その発話では一時的な返事が届かない。
 - 範囲外の値や知らないフィールドがあると `invalid_message` が届き、その発話は始まらない。
 - 一時的な返事を作るモデルは、クライアントからは変えられない（`STT_ACK_MODEL`）。

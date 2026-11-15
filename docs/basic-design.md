@@ -52,6 +52,7 @@ uvicorn（STT_WORKERS 個のワーカープロセス）
 | `backchannel_stream.py` | 1 つの発話の音声を予測器へ渡し、相槌を出すと決めたら文言を決めて送る（順に回すか、話の種類で選ぶか） |
 | `backchannel_triggers.py` | フレームの予測の列から、相槌の準備と相槌を出す合図を決める（`maai` と `silence` の規則。純粋なロジック） |
 | `silero_vad_predictor.py` | Silero VAD で、32ms ごとに話し手が話していない確率を予測する |
+| `backchannel_interval.py` | 相槌どうしの最短の間隔を、発話の経過時間と相槌の回数に合わせて伸ばす（純粋なロジック） |
 | `backchannel_peaks.py` | 1 つの発話の相槌の確率の列を、ログに残す山の一覧にまとめる（純粋なロジック） |
 | `utterance_recording.py` | 発話の音声（WAV）と相槌の確率（JSON）をファイルに保存する |
 | `sample_transcription.py` | 途中までの波形を一時ファイルにして `SerialTranscriber` で文字起こしする |
@@ -105,7 +106,10 @@ ack_generator / stream_audio_decoder / pcm_audio / serial_transcriber` とする
 | `STT_BACKCHANNEL_TIMING` | `maai` | 相槌のタイミングの決め方。`maai` または `silence` |
 | `STT_BACKCHANNEL_THRESHOLD` | `0.5` | 相槌を出す確率のしきい値（`maai`）。0 より大きく 1 以下 |
 | `STT_BACKCHANNEL_SILENCE_MS` | `90` | 相槌を出すまでに待つ無音の長さ（`silence`、ミリ秒）。32 以上の整数 |
-| `STT_BACKCHANNEL_MIN_INTERVAL_MS` | `1500` | 相槌を出してから、次の相槌を出せるまでの最短の間隔（ミリ秒）。0 以上の整数 |
+| `STT_BACKCHANNEL_MIN_INTERVAL_MS` | `1500` | 話し始めの、相槌を出してから次の相槌を出せるまでの最短の間隔（ミリ秒）。0 以上の整数 |
+| `STT_BACKCHANNEL_INTERVAL_PER_MINUTE_MS` | `3000` | 1 分話すごとに最短の間隔へ足す長さ（ミリ秒）。0 以上の整数 |
+| `STT_BACKCHANNEL_INTERVAL_FACTOR` | `1.1` | 相槌を 1 回出すごとに最短の間隔を何倍にするか。1.0 以上 3.0 以下 |
+| `STT_BACKCHANNEL_MAX_INTERVAL_MS` | `8000` | 伸ばした最短の間隔の上限（ミリ秒）。0 以上の整数 |
 | `STT_BACKCHANNEL_PHRASES` | `うん,うんうん,はい,なるほど` | 相槌の文言の候補（カンマ区切り）。1 つ以上 |
 | `STT_ACK_OLLAMA_URL` | `http://127.0.0.1:11434` | 一時的な返事を作る Ollama の URL |
 | `STT_ACK_MODEL` | `gemma4:e2b` | 一時的な返事を作る Ollama のモデル |
@@ -253,6 +257,9 @@ haas で extras が入っていない場合、理由は
 | `threshold` | 数値、0 より大きく 1 以下。`timing` が `maai` のときだけ使う | `STT_BACKCHANNEL_THRESHOLD` |
 | `silence_ms` | 整数、32〜2,000。`timing` が `silence` のときだけ使う | `STT_BACKCHANNEL_SILENCE_MS` |
 | `min_interval_ms` | 整数、0〜60,000 | `STT_BACKCHANNEL_MIN_INTERVAL_MS` |
+| `interval_per_minute_ms` | 整数、0〜60,000 | `STT_BACKCHANNEL_INTERVAL_PER_MINUTE_MS` |
+| `interval_factor` | 数値、1.0〜3.0 | `STT_BACKCHANNEL_INTERVAL_FACTOR` |
+| `max_interval_ms` | 整数、0〜60,000 | `STT_BACKCHANNEL_MAX_INTERVAL_MS` |
 | `phrases_by_kind` | 話の種類（下表）から文言への対応、1〜14 個。文言は 1〜20 文字の文字列、または 1〜5 個の配列 | 指定しない（`phrases` を順に使う） |
 
 - `phrases` と `phrases_by_kind` を両方指定すると `invalid_message` になる。
@@ -346,12 +353,28 @@ haas で extras が入っていない場合、理由は
     RMS（音量）で無音を判定しないのは、車内のロードノイズなどで声と雑音の大きさが近いと
     誤判定が増えるため（人工の低域雑音で SNR 10dB にすると、誤反応が 5 回から 20 回に増えた。
     Silero VAD は SNR 0dB でも 3 回）。
-- 前の相槌から最短の間隔（`backchannel.min_interval_ms`、省略時は `STT_BACKCHANNEL_MIN_INTERVAL_MS`）
-  が経っていなければ出さない。`offset_ms`（音声上の時刻）で測る。
+- 前の相槌から最短の間隔が経っていなければ出さない。`offset_ms`（音声上の時刻）で測る。
+  最短の間隔は、相槌を出そうとする位置（発話の先頭からの経過）と、それまでに出した相槌の回数で伸ばす。
+  人は相手の話が長くなるほど相槌を減らすため。
+
+  ```
+  間隔 = min(上限, (min_interval_ms + 経過分 × interval_per_minute_ms) × interval_factor ^ n)
+  ```
+
+  - n は前の相槌より前に出した相槌の数（1 回目と 2 回目の間は n = 0）。
+  - 上限は `max_interval_ms`。`min_interval_ms` より小さいときは `min_interval_ms`。
+  - 各項目は `backchannel` で指定し、省略時は `STT_BACKCHANNEL_MIN_INTERVAL_MS`・
+    `STT_BACKCHANNEL_INTERVAL_PER_MINUTE_MS`・`STT_BACKCHANNEL_INTERVAL_FACTOR`・
+    `STT_BACKCHANNEL_MAX_INTERVAL_MS`。
+  - 既定（1 分ごとに 3 秒、1.1 倍、上限 8 秒）で、ARGOS の 60 秒の発話で `silence` が相槌を出した
+    17 か所（`min_interval_ms` 2,500）に当てはめると、9 回に減り、間隔は 3.5 秒から 10 秒前後へ広がる。
 - `phrases_by_kind` を指定しない発話では、文言（`backchannel.phrases`、省略時は
   `STT_BACKCHANNEL_PHRASES`）を順に使う。同じ文言が続かないようにするため。
-- `phrases_by_kind` を指定した発話では、相槌を出すと決めたフレームまでの音声を文字起こしし、
-  Kev（判断だけを返すモデル。`/v1/systemone`）に話の種類を 1 つ選ばせ、その種類の文言を返す。
+- `phrases_by_kind` を指定した発話では、相槌を出すと決めたフレームまでの直近 15 秒の音声を
+  文字起こしし、Kev（判断だけを返すモデル。`/v1/systemone`）に話の種類を 1 つ選ばせ、その種類の文言を返す。
+  - 直近 15 秒にするのは、発話の頭から文字起こしすると、長い話ほど判定が遅れて
+    `STT_BACKCHANNEL_JUDGE_TIMEOUT_MS` に間に合わなくなるため。ARGOS の録音（25 か所）では、
+    直近 15 秒で 22 か所が頭からと同じ種類になった（10 秒は 15 か所、8 秒は 9 か所）。
   - `maai` では、確率がしきい値の 2/3 を下から上へ超えたフレームで、そのフレームまでの音声で判定を先に始める。
     同じ山（確率がしきい値の 2/3 以上のまま続く区間）でしきい値を超えたら、その判定の結果を使う。
     確率はしきい値に届く 1〜2 フレーム前から上がり始めるため、途中の文字起こしと判定の時間
@@ -391,7 +414,7 @@ haas で extras が入っていない場合、理由は
 - `.wav`：受け取った音声をデコードした 16kHz モノラル 16bit。予測器と文字起こしに渡したものと同じ。
 - `.json`：`utterance_id`、`recorded_at`（発話の開始時刻）、`sample_rate_hz`、`duration_ms`、
   `timing`（`maai` なら `threshold` と `prepare_threshold`、`silence` なら `silence_ms` も入る）、
-  `min_interval_ms`、`frames`（毎フレームの `offset_ms` と `probability`。`silence` では話していない確率）、`prepares`（判定を先に始めたフレーム）、`fires`（相槌を出すと決めたフレームと
+  `min_interval_ms`・`interval_per_minute_ms`・`interval_factor`・`max_interval_ms`、`frames`（毎フレームの `offset_ms` と `probability`。`silence` では話していない確率）、`prepares`（判定を先に始めたフレーム）、`fires`（相槌を出すと決めたフレームと
   `has_prepared`）。話の種類と送ったかどうかは、同じ `offset_ms` の `backchannel decision` のログで分かる。
 - 予測が残りの音声を処理し終えてから保存する。保存は別スレッドで行い、失敗しても発話の処理は続け、
   ログに保存先と一緒に残す。
@@ -600,6 +623,8 @@ Kev は `127.0.0.1` だけで待ち受け、`KEV_API_KEY` で Bearer 認証を�
 - メッセージの順序の誤り（発話中の `start` など）と、各 `error` の `code`
 - 1 発話で `started` → `backchannel` → `transcript` → `ack` の順にイベントが届くこと
 - 相槌の決め方（しきい値の立ち上がり、最短の間隔、文言の順番、`end` 後の予測を送らないこと）
+- 最短の間隔が経過時間と相槌の回数で伸び、上限で止まること（上限が最短の間隔より小さいときは最短の間隔）
+- 話の種類の判定に使う途中の音声が、直近の長さで切られること
 - 判定を先に始める合図と、その結果を同じ山の相槌でだけ使うこと。確率の山のまとめ方
 - `silence` の決め方（無音が続いたら出す、1 つの無音で 1 回、先頭の無音で出さない、話し始めたら準備を捨てる）と、
   `timing: "silence"` の発話で MaAI を使わないこと。Silero VAD の予測器は実際のモデルで、32ms ごとの位置と、

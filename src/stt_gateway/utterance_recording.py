@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .audio_decoding import AudioSamples
+from .backchannel_interval import BackchannelInterval
 from .backchannel_policy import BackchannelFire, BackchannelFrame
 from .backchannel_triggers import (
     PREPARE_THRESHOLD_RATIO,
@@ -48,7 +49,7 @@ class UtteranceRecording:
     recorded_at: datetime
     samples: AudioSamples
     timing: BackchannelTiming
-    min_interval_ms: int
+    interval: BackchannelInterval
     trace: BackchannelTrace
 
 
@@ -61,7 +62,10 @@ def recording_document(recording: UtteranceRecording) -> dict[str, object]:
         "sample_rate_hz": STREAM_SAMPLE_RATE_HZ,
         "duration_ms": len(recording.samples) * MILLISECONDS_PER_SECOND // STREAM_SAMPLE_RATE_HZ,
         **_timing_document(recording.timing),
-        "min_interval_ms": recording.min_interval_ms,
+        "min_interval_ms": recording.interval.min_interval_ms,
+        "interval_per_minute_ms": recording.interval.per_minute_ms,
+        "interval_factor": recording.interval.factor,
+        "max_interval_ms": recording.interval.max_interval_ms,
         "frames": [_frame_document(frame) for frame in trace.frames],
         "prepares": [_frame_document(frame) for frame in trace.prepares],
         "fires": [

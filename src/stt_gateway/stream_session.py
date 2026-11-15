@@ -23,7 +23,7 @@ from .backchannel_stream import (
     KindJudging,
     KindTarget,
     RotationEmitter,
-    samples_until_offset,
+    recent_samples,
 )
 from .backchannel_triggers import BackchannelTiming, ProbabilityTiming, create_trigger
 from .backends import BackendDescription
@@ -63,6 +63,10 @@ logger = logging.getLogger(__name__)
 # 相槌の予測モデルが日本語用のため、/stream は日本語だけを受け付ける。
 SUPPORTED_LANGUAGES: tuple[str, ...] = ("ja",)
 MILLISECONDS_PER_SECOND = 1000
+# 話の種類の判定では、途中の文字起こしを直近のこの長さだけにする。発話の頭から文字起こしすると
+# 長い話ほど判定が遅れて時間切れになるため。Kev に渡すのは最後の文だけで、ARGOS の録音では
+# 直近 15 秒で 25 件中 22 件が頭からと同じ種類になった（10 秒は 15 件、8 秒は 9 件）。
+PARTIAL_TRANSCRIPTION_WINDOW_MS = 15_000
 
 
 @dataclass(frozen=True)
@@ -104,8 +108,8 @@ class _ReceivingUtterance:
     sample_count: int = 0
 
     def samples_until(self, offset_ms: int) -> AudioSamples:
-        """受け取った音声の先頭から offset_ms までを返す。"""
-        return samples_until_offset(self.chunks, offset_ms)
+        """話の種類の判定に使う、offset_ms までの直近 PARTIAL_TRANSCRIPTION_WINDOW_MS の音声を返す。"""
+        return recent_samples(self.chunks, offset_ms, PARTIAL_TRANSCRIPTION_WINDOW_MS)
 
     def all_samples(self) -> AudioSamples:
         """受け取った音声すべてを 1 つの波形にする。"""
@@ -283,7 +287,7 @@ class StreamSession:
         return BackchannelStream(
             utterance.utterance_id,
             lease.predictor,
-            create_trigger(rule.timing, rule.min_interval_ms),
+            create_trigger(rule.timing, rule.interval),
             self._pool_for(rule.timing),
             self._emitter_for(utterance, plan),
         )
@@ -374,7 +378,7 @@ class StreamSession:
                 utterance.started_at,
                 samples,
                 run.rule.timing,
-                run.rule.min_interval_ms,
+                run.rule.interval,
                 run.stream.trace(),
             )
         )

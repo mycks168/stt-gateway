@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from stt_gateway.ack_generator import AckRequest
 from stt_gateway.ack_prompt import DEFAULT_ACK_PROMPT, AckPrompt
+from stt_gateway.backchannel_interval import BackchannelInterval
 from stt_gateway.backchannel_triggers import ProbabilityTiming, SilenceTiming
 from stt_gateway.config import AckSettings, BackchannelSettings
 from stt_gateway.stream_messages import (
@@ -25,29 +26,43 @@ from stt_gateway.stream_options import (
 _ACK_DEFAULTS = AckSettings(
     "http://ollama.test", "gemma4:e2b", 1500, 20, "ちょっと確認するね。", "30m"
 )
-_BACKCHANNEL_DEFAULTS = BackchannelSettings(4, "maai", 0.5, 120, 1500, ("うん", "はい"))
+_BACKCHANNEL_DEFAULTS = BackchannelSettings(
+    4, "maai", 0.5, 120, 1500, 3000, 1.1, 8000, ("うん", "はい")
+)
 _DEFAULT_TIMING = ProbabilityTiming(0.5)
+_DEFAULT_INTERVAL = BackchannelInterval(1500, 3000, 1.1, 8000)
 # 会話例の上限（8 個）を 1 つ超える数
 _NINE_EXAMPLES = ",".join(['{"user": "a", "reply": "b"}'] * 9)
 
 
 def test_backchannel_rule_defaults_to_server_settings() -> None:
     assert resolve_backchannel_rule(None, _BACKCHANNEL_DEFAULTS) == BackchannelRule(
-        _DEFAULT_TIMING, 1500, RotationPhrasing(("うん", "はい"))
+        _DEFAULT_TIMING, _DEFAULT_INTERVAL, RotationPhrasing(("うん", "はい"))
     )
     assert resolve_backchannel_rule(BackchannelOptions(), _BACKCHANNEL_DEFAULTS) == BackchannelRule(
-        _DEFAULT_TIMING, 1500, RotationPhrasing(("うん", "はい"))
+        _DEFAULT_TIMING, _DEFAULT_INTERVAL, RotationPhrasing(("うん", "はい"))
     )
 
 
 def test_backchannel_rule_uses_given_fields_only() -> None:
     options = BackchannelOptions(threshold=0.3, phrases=["はい", "ええ"])
     assert resolve_backchannel_rule(options, _BACKCHANNEL_DEFAULTS) == BackchannelRule(
-        ProbabilityTiming(0.3), 1500, RotationPhrasing(("はい", "ええ"))
+        ProbabilityTiming(0.3), _DEFAULT_INTERVAL, RotationPhrasing(("はい", "ええ"))
     )
     assert resolve_backchannel_rule(
         BackchannelOptions(min_interval_ms=0), _BACKCHANNEL_DEFAULTS
-    ) == BackchannelRule(_DEFAULT_TIMING, 0, RotationPhrasing(("うん", "はい")))
+    ) == BackchannelRule(
+        _DEFAULT_TIMING, BackchannelInterval(0, 3000, 1.1, 8000), RotationPhrasing(("うん", "はい"))
+    )
+
+
+def test_backchannel_rule_resolves_interval_growth() -> None:
+    options = BackchannelOptions(
+        interval_per_minute_ms=0, interval_factor=1.5, max_interval_ms=4000
+    )
+    assert resolve_backchannel_rule(options, _BACKCHANNEL_DEFAULTS).interval == BackchannelInterval(
+        1500, 0, 1.5, 4000
+    )
 
 
 def test_backchannel_rule_resolves_silence_timing() -> None:
@@ -57,7 +72,7 @@ def test_backchannel_rule_resolves_silence_timing() -> None:
     )
     custom = BackchannelOptions(timing="silence", silence_ms=200)
     assert resolve_backchannel_rule(custom, _BACKCHANNEL_DEFAULTS).timing == SilenceTiming(200)
-    silence_server = BackchannelSettings(4, "silence", 0.5, 150, 1500, ("うん",))
+    silence_server = BackchannelSettings(4, "silence", 0.5, 150, 1500, 0, 1.0, 1500, ("うん",))
     assert resolve_backchannel_rule(None, silence_server).timing == SilenceTiming(150)
     maai = BackchannelOptions(timing="maai", silence_ms=200)
     assert resolve_backchannel_rule(maai, silence_server).timing == ProbabilityTiming(0.5)
@@ -65,8 +80,22 @@ def test_backchannel_rule_resolves_silence_timing() -> None:
 
 @pytest.mark.parametrize(
     "backchannel",
-    [{"timing": "vad"}, {"silence_ms": 31}, {"silence_ms": 2001}],
-    ids=["unknown-timing", "too-short", "too-long"],
+    [
+        {"timing": "vad"},
+        {"silence_ms": 31},
+        {"silence_ms": 2001},
+        {"interval_factor": 0.9},
+        {"interval_factor": 3.1},
+        {"max_interval_ms": -1},
+    ],
+    ids=[
+        "unknown-timing",
+        "silence-too-short",
+        "silence-too-long",
+        "factor-shrinks",
+        "factor-too-large",
+        "negative-max-interval",
+    ],
 )
 def test_backchannel_rejects_invalid_timing_options(backchannel: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
@@ -158,6 +187,6 @@ def test_backchannel_rule_uses_phrases_by_kind() -> None:
     )
     assert resolve_backchannel_rule(options, _BACKCHANNEL_DEFAULTS) == BackchannelRule(
         _DEFAULT_TIMING,
-        1500,
+        _DEFAULT_INTERVAL,
         KindPhrasing({"news": ("そうなんだ",), "sad_or_trouble": ("そっか", "そっかぁ")}),
     )
