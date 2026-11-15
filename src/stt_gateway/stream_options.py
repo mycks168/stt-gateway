@@ -9,6 +9,7 @@ from typing import Literal
 from .ack_generator import AckRequest
 from .ack_prompt import DEFAULT_ACK_PROMPT, AckPrompt
 from .backchannel_policy import BackchannelKind
+from .backchannel_triggers import BackchannelTiming, ProbabilityTiming, SilenceTiming
 from .config import AckSettings, BackchannelSettings
 from .stream_messages import AckOptions, BackchannelOptions
 
@@ -31,7 +32,7 @@ class KindPhrasing:
 class BackchannelRule:
     """1 つの発話で相槌を出す規則。"""
 
-    threshold: float
+    timing: BackchannelTiming
     min_interval_ms: int
     phrasing: RotationPhrasing | KindPhrasing
 
@@ -42,15 +43,29 @@ def resolve_backchannel_rule(
     """指定された項目はそのまま、省略された項目はサーバの設定を使う。"""
     if options is None:
         return BackchannelRule(
-            defaults.threshold, defaults.min_interval_ms, RotationPhrasing(defaults.phrases)
+            _resolve_timing(BackchannelOptions(), defaults),
+            defaults.min_interval_ms,
+            RotationPhrasing(defaults.phrases),
         )
     return BackchannelRule(
-        threshold=defaults.threshold if options.threshold is None else options.threshold,
+        timing=_resolve_timing(options, defaults),
         min_interval_ms=(
             defaults.min_interval_ms if options.min_interval_ms is None else options.min_interval_ms
         ),
         phrasing=_resolve_phrasing(options, defaults),
     )
+
+
+def _resolve_timing(
+    options: BackchannelOptions, defaults: BackchannelSettings
+) -> BackchannelTiming:
+    """タイミングの決め方を決める。選ばなかった決め方の項目（threshold か silence_ms）は使わない。"""
+    timing = defaults.timing if options.timing is None else options.timing
+    if timing == "silence":
+        return SilenceTiming(
+            defaults.silence_ms if options.silence_ms is None else options.silence_ms
+        )
+    return ProbabilityTiming(defaults.threshold if options.threshold is None else options.threshold)
 
 
 def _resolve_phrasing(

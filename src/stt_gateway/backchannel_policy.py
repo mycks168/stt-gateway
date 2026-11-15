@@ -1,4 +1,4 @@
-"""相槌の確率の列から、相槌を出すかどうかと文言を決める。予測器のインタフェースもここに置く。"""
+"""相槌の判断に使う型（話の種類・フレーム・合図）と、予測器・トリガー・文言の順番のインタフェース。"""
 
 from __future__ import annotations
 
@@ -28,6 +28,12 @@ BackchannelKind = Literal[
     "wrapping_up",
 ]
 BACKCHANNEL_KINDS: tuple[BackchannelKind, ...] = get_args(BackchannelKind)
+
+# 相槌のタイミングの決め方。maai は MaAI の確率、silence は Silero VAD で無音が続いたことで決める。
+BackchannelTimingName = Literal["maai", "silence"]
+BACKCHANNEL_TIMING_NAMES: tuple[BackchannelTimingName, ...] = get_args(BackchannelTimingName)
+# Silero VAD は 32ms ごとに判定するため、それより短い無音は見分けられない。
+MIN_BACKCHANNEL_SILENCE_MS = 32
 
 
 @dataclass(frozen=True)
@@ -71,33 +77,30 @@ class PhraseRotation:
         return phrase
 
 
-class BackchannelTrigger:
-    """1 つの発話の中で、確率がしきい値を下から上へ超えたフレームでだけ相槌を出す。
+@dataclass(frozen=True)
+class BackchannelPrepare:
+    """相槌を出しそうなフレーム。文言を決める準備（話の種類の判定）を先に始めてよい。"""
 
-    しきい値を超えている間ずっと出すと、1 つの間に何度も相槌を打ってしまうため。
-    前の相槌から min_interval_ms 経つまでは出さない。予測は近い位置で続けて山を作ることがあるため。
-    文言は決めない（順に回すか、話の種類で選ぶかは呼び出し側が決める）。
+    frame: BackchannelFrame
+
+
+@dataclass(frozen=True)
+class BackchannelFire:
+    """相槌を出すと決めたフレーム。
+
+    has_prepared は、同じ山（maai）または同じ無音（silence）で直前に BackchannelPrepare を出したか。
     """
 
-    def __init__(self, threshold: float, min_interval_ms: int) -> None:
-        """しきい値と最短の間隔を受け取る。"""
-        self._threshold = threshold
-        self._min_interval_ms = min_interval_ms
-        self._was_above_threshold = False
-        self._last_fired_offset_ms: int | None = None
+    frame: BackchannelFrame
+    has_prepared: bool
 
-    def observe(self, frame: BackchannelFrame) -> BackchannelFrame | None:
-        """フレームの予測を受け取り、相槌を出すならそのフレームを返す。"""
-        is_above_threshold = frame.probability >= self._threshold
-        is_rising_edge = is_above_threshold and not self._was_above_threshold
-        self._was_above_threshold = is_above_threshold
-        if not is_rising_edge or self._is_within_min_interval(frame.offset_ms):
-            return None
-        self._last_fired_offset_ms = frame.offset_ms
-        return frame
 
-    def _is_within_min_interval(self, offset_ms: int) -> bool:
-        """前の相槌から最短の間隔が経っていないかを返す。"""
-        if self._last_fired_offset_ms is None:
-            return False
-        return offset_ms - self._last_fired_offset_ms < self._min_interval_ms
+BackchannelSignal = BackchannelPrepare | BackchannelFire
+
+
+class BackchannelTrigger(Protocol):
+    """フレームの予測を順に受け取り、準備や相槌の合図を出す。1 つの発話の中で状態を持つ。"""
+
+    def observe(self, frame: BackchannelFrame) -> BackchannelSignal | None:
+        """フレームを受け取り、準備を始めるか相槌を出すなら、その合図を返す。"""
+        ...

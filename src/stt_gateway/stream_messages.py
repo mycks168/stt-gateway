@@ -16,7 +16,9 @@ from pydantic import (
 from .ack_generator import AckSource
 from .backchannel_policy import (
     BACKCHANNEL_KINDS,
+    MIN_BACKCHANNEL_SILENCE_MS,
     BackchannelKind,
+    BackchannelTimingName,
     BackchannelUnavailableReason,
 )
 from .stream_audio_decoder import AudioEncoding
@@ -45,6 +47,8 @@ MAX_ACK_CHARS_LIMIT = 100
 MAX_BACKCHANNEL_PHRASES = 10
 MAX_BACKCHANNEL_PHRASE_CHARS = 20
 MAX_BACKCHANNEL_MIN_INTERVAL_MS = 60000
+# 無音を長く待つほど、相槌が話の続きにかぶる。
+MAX_BACKCHANNEL_SILENCE_MS = 2000
 MAX_PHRASES_PER_KIND = 5
 
 
@@ -92,7 +96,11 @@ class BackchannelOptions(_StrictOptions):
         ]
         | None
     ) = None
+    timing: BackchannelTimingName | None = None
     threshold: Annotated[float, Field(gt=0.0, le=1.0)] | None = None
+    silence_ms: (
+        Annotated[int, Field(ge=MIN_BACKCHANNEL_SILENCE_MS, le=MAX_BACKCHANNEL_SILENCE_MS)] | None
+    ) = None
     min_interval_ms: Annotated[int, Field(ge=0, le=MAX_BACKCHANNEL_MIN_INTERVAL_MS)] | None = None
     phrases_by_kind: (
         Annotated[
@@ -144,7 +152,10 @@ class StartedEvent(BaseModel):
 
 
 class BackchannelEvent(BaseModel):
-    """相槌。kind は話の種類で選んだときの種類（順に回したときは None）。"""
+    """相槌。kind は話の種類で選んだときの種類（順に回したときは None）。
+
+    probability は、timing が maai なら相槌を打つべき確率、silence なら話していない確率。
+    """
 
     type: Literal["backchannel"] = "backchannel"
     utterance_id: UtteranceId

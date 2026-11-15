@@ -51,8 +51,11 @@ ollama pull gemma4:e2b
 | `STT_MAX_REQUESTS` | `0` | 1 ワーカーがこの件数を処理したら、ワーカーを起動し直す。`0` で無効 |
 | `STT_MAX_REQUESTS_JITTER` | `0` | 起動し直すまでの件数を、ワーカーごとに 0〜この値だけずらす |
 | `STT_STREAM_MAX_UTTERANCE_SECONDS` | `60` | `/stream` の 1 発話の音声の上限（秒） |
+| `STT_STREAM_RECORDING_DIR` | (空) | 指定すると、相槌を予測した `/stream` の発話ごとに、音声（`.wav`）と相槌の確率（`.json`）をこのディレクトリに保存する。空なら保存しない。保存したファイルは自動では消えない |
 | `STT_BACKCHANNEL_MAX_SESSIONS` | `4` | 1 ワーカーで同時に相槌を出せる発話の数。超えた発話は相槌なしになる |
+| `STT_BACKCHANNEL_TIMING` | `maai` | 相槌のタイミングの決め方（`maai` / `silence`）。`start` で発話ごとに変えられる |
 | `STT_BACKCHANNEL_THRESHOLD` | `0.5` | 相槌を出す確率のしきい値（0 より大きく 1 以下）。小さいほど相槌が増える |
+| `STT_BACKCHANNEL_SILENCE_MS` | `90` | `timing` が `silence` のとき、相槌を出すまでに待つ無音の長さ（ミリ秒、32 以上） |
 | `STT_BACKCHANNEL_MIN_INTERVAL_MS` | `1500` | 相槌と相槌の最短の間隔（ミリ秒） |
 | `STT_BACKCHANNEL_PHRASES` | `うん,うんうん,はい,なるほど` | 相槌の文言（カンマ区切り）。順に使う |
 | `STT_ACK_OLLAMA_URL` | `http://127.0.0.1:11434` | 一時的な返事を作る Ollama の URL |
@@ -243,9 +246,16 @@ curl -X POST http://127.0.0.1:23000/transcribe \
 | `ack.fallback_text` | 1〜50 文字 | `STT_ACK_FALLBACK_TEXT` |
 | `ack.max_chars` | 1〜100 | `STT_ACK_MAX_CHARS` |
 | `backchannel.phrases` | 1〜20 文字の文言、1〜10 個 | `STT_BACKCHANNEL_PHRASES` |
-| `backchannel.threshold` | 0 より大きく 1 以下 | `STT_BACKCHANNEL_THRESHOLD` |
+| `backchannel.timing` | `maai` / `silence` | `STT_BACKCHANNEL_TIMING` |
+| `backchannel.threshold` | 0 より大きく 1 以下（`timing` が `maai` のときだけ使う） | `STT_BACKCHANNEL_THRESHOLD` |
+| `backchannel.silence_ms` | 32〜2,000（`timing` が `silence` のときだけ使う） | `STT_BACKCHANNEL_SILENCE_MS` |
 | `backchannel.min_interval_ms` | 0〜60,000 | `STT_BACKCHANNEL_MIN_INTERVAL_MS` |
 
+- `backchannel.timing` は相槌を打つタイミングの決め方。`maai` は相槌の予測モデル（MaAI）の確率が
+  `threshold` を超えたところ、`silence` は話していない状態（Silero VAD で判定）が `silence_ms`
+  続いたところで相槌を出す。`silence` では、話し始める前の無音では相槌を出さず、1 つの切れ目では
+  1 回だけ出す。`backchannel` イベントの `probability` は、`maai` では相槌を打つべき確率、
+  `silence` では話していない確率になる。
 - `"ack": false` にすると、その発話では一時的な返事が届かない。
 - 範囲外の値や知らないフィールドがあると `invalid_message` が届き、その発話は始まらない。
 - 一時的な返事を作るモデルは、クライアントからは変えられない（`STT_ACK_MODEL`）。

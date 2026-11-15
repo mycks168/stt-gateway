@@ -11,6 +11,7 @@ from stt_gateway.config import (
     load_backchannel_judge_settings,
     load_backchannel_settings,
     load_max_utterance_seconds,
+    load_stream_recording_dir,
     parse_backend,
 )
 
@@ -30,7 +31,9 @@ def test_parse_backend_rejects_unknown_backend() -> None:
 
 _STREAM_ENV_NAMES = (
     "STT_BACKCHANNEL_MAX_SESSIONS",
+    "STT_BACKCHANNEL_TIMING",
     "STT_BACKCHANNEL_THRESHOLD",
+    "STT_BACKCHANNEL_SILENCE_MS",
     "STT_BACKCHANNEL_MIN_INTERVAL_MS",
     "STT_BACKCHANNEL_PHRASES",
     "STT_ACK_OLLAMA_URL",
@@ -57,7 +60,9 @@ def test_stream_settings_defaults() -> None:
     ack = load_ack_settings()
     assert backchannel == BackchannelSettings(
         max_sessions=4,
+        timing="maai",
         threshold=0.5,
+        silence_ms=90,
         min_interval_ms=1500,
         phrases=("うん", "うんうん", "はい", "なるほど"),
     )
@@ -76,6 +81,10 @@ def test_stream_settings_read_environment(clean_stream_env: pytest.MonkeyPatch) 
     clean_stream_env.setenv("STT_BACKCHANNEL_THRESHOLD", "1")
     assert load_backchannel_settings().phrases == ("うん", "へえ")
     assert load_backchannel_settings().threshold == 1.0
+    clean_stream_env.setenv("STT_BACKCHANNEL_TIMING", " silence ")
+    clean_stream_env.setenv("STT_BACKCHANNEL_SILENCE_MS", "200")
+    assert load_backchannel_settings().timing == "silence"
+    assert load_backchannel_settings().silence_ms == 200
     assert load_ack_settings().ollama_url == "http://ollama:11434"
 
 
@@ -141,3 +150,24 @@ def test_backchannel_judge_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("STT_BACKCHANNEL_JUDGE_TIMEOUT_MS", "0")
     with pytest.raises(ValueError, match="STT_BACKCHANNEL_JUDGE_TIMEOUT_MS"):
         load_backchannel_judge_settings()
+
+
+def test_stream_recording_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("STT_STREAM_RECORDING_DIR", raising=False)
+    assert load_stream_recording_dir() is None
+    monkeypatch.setenv("STT_STREAM_RECORDING_DIR", "  ")
+    assert load_stream_recording_dir() is None
+    monkeypatch.setenv("STT_STREAM_RECORDING_DIR", "~/stream-recordings")
+    assert load_stream_recording_dir() == Path.home() / "stream-recordings"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [("STT_BACKCHANNEL_TIMING", "vad"), ("STT_BACKCHANNEL_SILENCE_MS", "31")],
+)
+def test_backchannel_settings_reject_invalid_timing(
+    clean_stream_env: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    clean_stream_env.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
+        load_backchannel_settings()

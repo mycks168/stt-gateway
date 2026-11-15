@@ -35,9 +35,11 @@ from .config import settings
 from .formats import UnsupportedAudioFormat, resolve_suffix
 from .maai_backchannel import create_maai_predictor
 from .serial_transcriber import SerialTranscriber
+from .silero_vad_predictor import create_silero_predictor
 from .stream_api import router as stream_router
 from .stream_session import StreamDependencies
 from .transcription import BackendName, Transcriber, UnsupportedLanguageError
+from .utterance_recording import UtteranceRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +80,7 @@ def build_stream_dependencies(
     return StreamDependencies(
         serial_transcriber=serial_transcriber,
         backchannel_pool=BackchannelPool(settings.backchannel.max_sessions, create_maai_predictor),
+        silence_pool=BackchannelPool(settings.backchannel.max_sessions, create_silero_predictor),
         ack_generator=ack_generator,
         backend=describe_backend(settings),
         default_language=settings.language,
@@ -85,6 +88,9 @@ def build_stream_dependencies(
         backchannel=settings.backchannel,
         ack=settings.ack,
         kind_judging=build_kind_judging(serial_transcriber, client),
+        recorder=None
+        if settings.stream_recording_dir is None
+        else UtteranceRecorder(settings.stream_recording_dir),
     )
 
 

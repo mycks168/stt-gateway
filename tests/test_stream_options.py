@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from stt_gateway.ack_generator import AckRequest
 from stt_gateway.ack_prompt import DEFAULT_ACK_PROMPT, AckPrompt
+from stt_gateway.backchannel_triggers import ProbabilityTiming, SilenceTiming
 from stt_gateway.config import AckSettings, BackchannelSettings
 from stt_gateway.stream_messages import (
     CLIENT_MESSAGE_ADAPTER,
@@ -24,28 +25,52 @@ from stt_gateway.stream_options import (
 _ACK_DEFAULTS = AckSettings(
     "http://ollama.test", "gemma4:e2b", 1500, 20, "ちょっと確認するね。", "30m"
 )
-_BACKCHANNEL_DEFAULTS = BackchannelSettings(4, 0.5, 1500, ("うん", "はい"))
+_BACKCHANNEL_DEFAULTS = BackchannelSettings(4, "maai", 0.5, 120, 1500, ("うん", "はい"))
+_DEFAULT_TIMING = ProbabilityTiming(0.5)
 # 会話例の上限（8 個）を 1 つ超える数
 _NINE_EXAMPLES = ",".join(['{"user": "a", "reply": "b"}'] * 9)
 
 
 def test_backchannel_rule_defaults_to_server_settings() -> None:
     assert resolve_backchannel_rule(None, _BACKCHANNEL_DEFAULTS) == BackchannelRule(
-        0.5, 1500, RotationPhrasing(("うん", "はい"))
+        _DEFAULT_TIMING, 1500, RotationPhrasing(("うん", "はい"))
     )
     assert resolve_backchannel_rule(BackchannelOptions(), _BACKCHANNEL_DEFAULTS) == BackchannelRule(
-        0.5, 1500, RotationPhrasing(("うん", "はい"))
+        _DEFAULT_TIMING, 1500, RotationPhrasing(("うん", "はい"))
     )
 
 
 def test_backchannel_rule_uses_given_fields_only() -> None:
     options = BackchannelOptions(threshold=0.3, phrases=["はい", "ええ"])
     assert resolve_backchannel_rule(options, _BACKCHANNEL_DEFAULTS) == BackchannelRule(
-        0.3, 1500, RotationPhrasing(("はい", "ええ"))
+        ProbabilityTiming(0.3), 1500, RotationPhrasing(("はい", "ええ"))
     )
     assert resolve_backchannel_rule(
         BackchannelOptions(min_interval_ms=0), _BACKCHANNEL_DEFAULTS
-    ) == BackchannelRule(0.5, 0, RotationPhrasing(("うん", "はい")))
+    ) == BackchannelRule(_DEFAULT_TIMING, 0, RotationPhrasing(("うん", "はい")))
+
+
+def test_backchannel_rule_resolves_silence_timing() -> None:
+    silence = BackchannelOptions(timing="silence", threshold=0.9)
+    assert resolve_backchannel_rule(silence, _BACKCHANNEL_DEFAULTS).timing == SilenceTiming(120), (
+        "silence では threshold を使わず、silence_ms はサーバの設定"
+    )
+    custom = BackchannelOptions(timing="silence", silence_ms=200)
+    assert resolve_backchannel_rule(custom, _BACKCHANNEL_DEFAULTS).timing == SilenceTiming(200)
+    silence_server = BackchannelSettings(4, "silence", 0.5, 150, 1500, ("うん",))
+    assert resolve_backchannel_rule(None, silence_server).timing == SilenceTiming(150)
+    maai = BackchannelOptions(timing="maai", silence_ms=200)
+    assert resolve_backchannel_rule(maai, silence_server).timing == ProbabilityTiming(0.5)
+
+
+@pytest.mark.parametrize(
+    "backchannel",
+    [{"timing": "vad"}, {"silence_ms": 31}, {"silence_ms": 2001}],
+    ids=["unknown-timing", "too-short", "too-long"],
+)
+def test_backchannel_rejects_invalid_timing_options(backchannel: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        BackchannelOptions.model_validate(backchannel)
 
 
 def test_ack_request_defaults_and_disable() -> None:
@@ -132,5 +157,7 @@ def test_backchannel_rule_uses_phrases_by_kind() -> None:
         phrases_by_kind={"news": "そうなんだ", "sad_or_trouble": ["そっか", "そっかぁ"]}
     )
     assert resolve_backchannel_rule(options, _BACKCHANNEL_DEFAULTS) == BackchannelRule(
-        0.5, 1500, KindPhrasing({"news": ("そうなんだ",), "sad_or_trouble": ("そっか", "そっかぁ")})
+        _DEFAULT_TIMING,
+        1500,
+        KindPhrasing({"news": ("そうなんだ",), "sad_or_trouble": ("そっか", "そっかぁ")}),
     )

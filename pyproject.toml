@@ -38,9 +38,11 @@ haas = [
 ]
 
 # /stream で相槌を出すときだけ必要。MaAI は GUI やマイク入力の依存（PyQt5・pyaudio など）も
-# 必須にしており重いため extras に分ける。
+# 必須にしており重いため extras に分ける。silero-vad は無音を待って相槌を出すときに使う
+# （同梱の ONNX モデルを onnxruntime で直接動かす）。
 stream = [
   "maai>=0.2.27",
+  "silero-vad>=6.2.3",
 ]
 
 [tool.setuptools]

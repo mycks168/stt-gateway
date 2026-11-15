@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import httpx
@@ -9,7 +10,12 @@ import numpy as np
 import pytest
 
 from stt_gateway.backchannel_judge import BackchannelKindJudge
-from stt_gateway.backchannel_policy import BackchannelFrame, PhraseRotation
+from stt_gateway.backchannel_policy import (
+    BackchannelFire,
+    BackchannelFrame,
+    BackchannelPrepare,
+    PhraseRotation,
+)
 from stt_gateway.backchannel_stream import (
     KindEmitter,
     KindJudging,
@@ -46,14 +52,21 @@ class _FixedTranscriber:
         return Transcription(self._text, language, 0.1)
 
 
-def _emit_once(transcriber: _FixedTranscriber, *, is_open: bool = True) -> list[StreamEvent]:
-    """1 フレーム分の相槌を KindEmitter に渡し、送られたイベントを返す。"""
+EmitterScenario = Callable[[KindEmitter], Awaitable[None]]
 
-    def kev(_request: httpx.Request) -> httpx.Response:
+
+def _run_emitter(
+    transcriber: _FixedTranscriber, scenario: EmitterScenario
+) -> tuple[list[StreamEvent], int]:
+    """KindEmitter を scenario で動かし、送られたイベントと Kev へ問い合わせた回数を返す。"""
+    kev_requests: list[httpx.Request] = []
+
+    def kev(request: httpx.Request) -> httpx.Response:
         """いつも news を返すダミーの Kev。"""
+        kev_requests.append(request)
         return httpx.Response(200, json={"answers": {"kind": {"choice": "news"}}})
 
-    async def scenario() -> list[StreamEvent]:
+    async def run() -> list[StreamEvent]:
         sender = _RecordingSender()
         tasks: list[asyncio.Task[object]] = []
         async with httpx.AsyncClient(transport=httpx.MockTransport(kev)) as client:
@@ -73,11 +86,32 @@ def _emit_once(transcriber: _FixedTranscriber, *, is_open: bool = True) -> list[
                 sender,
                 tasks.append,
             )
-            await emitter.emit(BackchannelFrame(300, 0.7), lambda: is_open)
-            await asyncio.gather(*tasks)
+            await scenario(emitter)
+            while tasks:
+                await tasks.pop()
         return sender.events
 
-    return asyncio.run(scenario())
+    events = asyncio.run(run())
+    return events, len(kev_requests)
+
+
+def _emit_once(transcriber: _FixedTranscriber, *, is_open: bool = True) -> list[StreamEvent]:
+    """準備なしで 1 フレーム分の相槌を KindEmitter に渡し、送られたイベントを返す。"""
+
+    async def scenario(emitter: KindEmitter) -> None:
+        await emitter.emit(BackchannelFire(BackchannelFrame(300, 0.7), False), lambda: is_open)
+
+    return _run_emitter(transcriber, scenario)[0]
+
+
+def _prepare_then_emit(*, has_prepared: bool) -> tuple[list[StreamEvent], int]:
+    """準備の合図の後に相槌を出し、送られたイベントと Kev へ問い合わせた回数を返す。"""
+
+    async def scenario(emitter: KindEmitter) -> None:
+        emitter.prepare(BackchannelPrepare(BackchannelFrame(200, 0.45)))
+        await emitter.emit(BackchannelFire(BackchannelFrame(300, 0.7), has_prepared), lambda: True)
+
+    return _run_emitter(_FixedTranscriber("先週引っ越したんだ。"), scenario)
 
 
 def test_kind_emitter_sends_phrase_for_judged_kind(caplog: pytest.LogCaptureFixture) -> None:
@@ -117,6 +151,28 @@ def test_kind_emitter_skips_when_partial_transcription_fails(
 ) -> None:
     assert _emit_once(_FixedTranscriber("", RuntimeError("CUDA out of memory"))) == []
     assert "partial transcription for backchannel failed" in caplog.text
+
+
+def test_kind_emitter_uses_judgment_started_by_prepare(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="stt_gateway.backchannel_stream")
+    events, kev_request_count = _prepare_then_emit(has_prepared=True)
+    assert kev_request_count == 1, "準備で始めた判定を使い、判定し直さない"
+    assert events == [
+        BackchannelEvent(
+            utterance_id=UtteranceId(1),
+            text="そうなんだ",
+            offset_ms=300,
+            probability=0.7,
+            kind="news",
+        )
+    ]
+    assert "prepared=True" in caplog.text
+
+
+def test_kind_emitter_judges_again_when_preparation_is_not_for_this_peak() -> None:
+    events, kev_request_count = _prepare_then_emit(has_prepared=False)
+    assert kev_request_count == 2, "別の山の準備は使わず、相槌を出す位置で判定し直す"
+    assert len(events) == 1
 
 
 def test_samples_until_offset_cuts_at_frame() -> None:

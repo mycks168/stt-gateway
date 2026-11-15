@@ -9,6 +9,11 @@ from typing import get_args
 
 from dotenv import load_dotenv
 
+from .backchannel_policy import (
+    BACKCHANNEL_TIMING_NAMES,
+    MIN_BACKCHANNEL_SILENCE_MS,
+    BackchannelTimingName,
+)
 from .transcription import BackendName
 
 load_dotenv(override=False)
@@ -63,6 +68,18 @@ def _read_non_empty(name: str, default: str) -> str:
     return value
 
 
+def parse_backchannel_timing(value: str) -> BackchannelTimingName:
+    """相槌のタイミングの決め方の名前を読む。"""
+    name = value.strip()
+    for timing in BACKCHANNEL_TIMING_NAMES:
+        if name == timing:
+            return timing
+    raise ValueError(
+        f"invalid STT_BACKCHANNEL_TIMING: '{value}' "
+        f"(must be one of {', '.join(BACKCHANNEL_TIMING_NAMES)})"
+    )
+
+
 def parse_phrases(name: str, raw: str) -> tuple[str, ...]:
     """カンマ区切りの文言の一覧を読む。空の要素は捨て、1 つも無ければ ValueError にする。"""
     phrases = tuple(phrase.strip() for phrase in raw.split(",") if phrase.strip())
@@ -76,7 +93,9 @@ class BackchannelSettings:
     """/stream の相槌の設定。"""
 
     max_sessions: int
+    timing: BackchannelTimingName
     threshold: float
+    silence_ms: int
     min_interval_ms: int
     phrases: tuple[str, ...]
 
@@ -106,8 +125,12 @@ def load_backchannel_settings() -> BackchannelSettings:
     """相槌の設定を環境変数から読む。"""
     return BackchannelSettings(
         max_sessions=_read_int("STT_BACKCHANNEL_MAX_SESSIONS", "4", minimum=1),
+        timing=parse_backchannel_timing(os.getenv("STT_BACKCHANNEL_TIMING", "maai")),
         threshold=_read_float(
             "STT_BACKCHANNEL_THRESHOLD", "0.5", lower_exclusive=0.0, upper_inclusive=1.0
+        ),
+        silence_ms=_read_int(
+            "STT_BACKCHANNEL_SILENCE_MS", "90", minimum=MIN_BACKCHANNEL_SILENCE_MS
         ),
         min_interval_ms=_read_int("STT_BACKCHANNEL_MIN_INTERVAL_MS", "1500", minimum=0),
         phrases=parse_phrases(
@@ -148,6 +171,12 @@ def load_max_utterance_seconds() -> float:
     )
 
 
+def load_stream_recording_dir() -> Path | None:
+    """/stream の録音の保存先を環境変数から読む。空なら録音しない。"""
+    raw = os.getenv("STT_STREAM_RECORDING_DIR", "").strip()
+    return Path(raw).expanduser() if raw else None
+
+
 @dataclass(frozen=True)
 class Settings:
     """サーバ全体の設定。STT_MODEL / STT_DEVICE / STT_COMPUTE_TYPE は whisper バックエンド用。"""
@@ -167,6 +196,7 @@ class Settings:
         default_factory=load_backchannel_judge_settings
     )
     ack: AckSettings = field(default_factory=load_ack_settings)
+    stream_recording_dir: Path | None = field(default_factory=load_stream_recording_dir)
 
 
 settings = Settings()

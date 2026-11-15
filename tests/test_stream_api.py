@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import stat
 import time
 import wave
 from collections.abc import Callable, Iterator
@@ -85,6 +86,7 @@ _TEST_SETTING_CHANGES: dict[str, Any] = {
     "api_key": "",
     "language": "ja",
     "backchannel_judge": BackchannelJudgeSettings("", Path("/nonexistent"), 200),
+    "stream_recording_dir": None,
 }
 _KEV_URL = "http://kev.test:8009"
 _KEV_TOKEN = "kev-token-for-tests"
@@ -109,6 +111,8 @@ def transcriber(monkeypatch: pytest.MonkeyPatch) -> _RecordingTranscriber:
     _patch_settings(monkeypatch)
     monkeypatch.setattr(server, "load_transcriber", lambda _settings: fake)
     monkeypatch.setattr(server, "create_maai_predictor", lambda: _ScriptedPredictor([0.1, 0.9]))
+    # サーバの設定で timing が silence でも、本物の Silero VAD を読み込まないようにする。
+    monkeypatch.setattr(server, "create_silero_predictor", lambda: _ScriptedPredictor([0.1, 0.9]))
 
     async def fake_services(request: httpx.Request) -> httpx.Response:
         """ダミーの Ollama と Kev。リクエストを記録し、決まった答えを返す。"""
@@ -188,6 +192,61 @@ def test_stream_sends_backchannel_transcript_and_ack_in_order(
         assert isinstance(ack["latency_ms"], int)
 
     assert transcriber.sample_counts == [3200]
+
+
+@pytest.mark.usefixtures("transcriber")
+def test_stream_records_audio_and_probabilities(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    recording_dir = tmp_path / "recordings"
+    _patch_settings(monkeypatch, stream_recording_dir=recording_dir)
+    with (
+        TestClient(server.app) as client,
+        client.websocket_connect("/stream", headers=_AUTH_HEADERS) as websocket,
+    ):
+        _start(websocket, encoding="pcm_s16le")
+        websocket.send_bytes(_pcm(0.2))
+        assert websocket.receive_json()["type"] == "backchannel"
+        websocket.send_json({"type": "end"})
+        assert websocket.receive_json()["type"] == "transcript"
+        assert websocket.receive_json()["type"] == "ack"
+        _wait_until(lambda: len(list(recording_dir.glob("*.json"))) == 1)
+
+    [json_path] = recording_dir.glob("*-u1.json")
+    document = json.loads(json_path.read_text(encoding="utf-8"))
+    assert document["duration_ms"] == 200
+    assert document["threshold"] == 0.5
+    assert document["frames"] == [
+        {"offset_ms": 100, "probability": 0.1},
+        {"offset_ms": 200, "probability": 0.9},
+    ]
+    assert document["fires"] == [{"offset_ms": 200, "probability": 0.9, "has_prepared": False}]
+    with wave.open(str(json_path.with_suffix(".wav"))) as wav_file:
+        assert (wav_file.getframerate(), wav_file.getnframes()) == (16000, 3200)
+    assert stat.S_IMODE(json_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(recording_dir.stat().st_mode) == 0o700
+
+
+@pytest.mark.usefixtures("transcriber")
+def test_stream_uses_silence_timing_when_requested(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "create_maai_predictor", _unexpected_maai)
+    # 100ms 話してから無音（話していない確率 0.9）になる。
+    monkeypatch.setattr(server, "create_silero_predictor", lambda: _ScriptedPredictor([0.1, 0.9]))
+    with (
+        TestClient(server.app) as client,
+        client.websocket_connect("/stream", headers=_AUTH_HEADERS) as websocket,
+    ):
+        _start(
+            websocket, encoding="pcm_s16le", backchannel={"timing": "silence", "silence_ms": 100}
+        )
+        websocket.send_bytes(_pcm(0.2))
+        backchannel = websocket.receive_json()
+        assert (backchannel["offset_ms"], backchannel["probability"]) == (200, 0.9)
+
+
+def _unexpected_maai() -> _ScriptedPredictor:
+    """timing が silence の発話で MaAI を作ったら失敗させる。"""
+    raise AssertionError("MaAI must not be created for silence timing")
 
 
 def test_stream_decodes_opus_packets_by_default(
@@ -479,6 +538,23 @@ def test_stream_picks_backchannel_phrase_by_kind(
     assert transcriber.sample_counts[0] == 3200, "相槌のフレーム（200ms）までの音声を文字起こしする"
 
 
+def test_stream_sends_backchannel_judged_in_advance(
+    transcriber: _RecordingTranscriber,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="stt_gateway.backchannel_stream")
+    _enable_kind_judge(monkeypatch, tmp_path)
+    # 0.4 で準備（既定のしきい値 0.5 の 2/3 以上）、次の 0.9 で相槌を出す。
+    monkeypatch.setattr(server, "create_maai_predictor", lambda: _ScriptedPredictor([0.4, 0.9]))
+    with _kind_stream() as websocket:
+        websocket.send_bytes(_pcm(0.2))
+        assert websocket.receive_json()["offset_ms"] == 200
+    assert len(transcriber.kev_requests) == 1, "準備で始めた判定を使う"
+    assert "prepared=True" in caplog.text
+
+
 @pytest.mark.parametrize(
     "case",
     [("hesitating", 0.0), ("news", 0.5)],
@@ -506,6 +582,7 @@ def test_stream_skips_backchannel_for_unmapped_kind_or_timeout(
         assert websocket.receive_json()["type"] == "ack"
     assert transcriber.kev_requests, "判定は行われている"
     assert f"reason={reason}" in caplog.text
+    _wait_until(lambda: "backchannel probabilities (utterance_id=1, frames=" in caplog.text)
 
 
 @pytest.mark.parametrize("has_url", [False, True], ids=["no-url", "no-token-file"])

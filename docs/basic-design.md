@@ -49,6 +49,12 @@ uvicorn（STT_WORKERS 個のワーカープロセス）
 | `maai_backchannel.py` | MaAI（`vap_bc_jp`）で相槌の確率を予測する |
 | `backchannel_pool.py` | ワーカー内の予測器を上限数まで用意して貸し出す。上限に達していれば貸さない |
 | `backchannel_judge.py` | 途中までの書き起こしから、Kev で話の種類を判定する |
+| `backchannel_stream.py` | 1 つの発話の音声を予測器へ渡し、相槌を出すと決めたら文言を決めて送る（順に回すか、話の種類で選ぶか） |
+| `backchannel_triggers.py` | フレームの予測の列から、相槌の準備と相槌を出す合図を決める（`maai` と `silence` の規則。純粋なロジック） |
+| `silero_vad_predictor.py` | Silero VAD で、32ms ごとに話し手が話していない確率を予測する |
+| `backchannel_peaks.py` | 1 つの発話の相槌の確率の列を、ログに残す山の一覧にまとめる（純粋なロジック） |
+| `utterance_recording.py` | 発話の音声（WAV）と相槌の確率（JSON）をファイルに保存する |
+| `sample_transcription.py` | 途中までの波形を一時ファイルにして `SerialTranscriber` で文字起こしする |
 | `ack_generator.py` | Ollama の軽量 LLM で一時的な返事を作り、失敗時は固定の文言に差し替える |
 | `ack_prompt.py` | 一時的な返事の既定のシステムプロンプトと会話例、chat API のメッセージ列の組み立て（純粋なロジック） |
 | `stream_options.py` | `start` の `ack`・`backchannel` の指定とサーバの設定から、発話ごとの設定を決める（純粋なロジック） |
@@ -95,7 +101,10 @@ ack_generator / stream_audio_decoder / pcm_audio / serial_transcriber` とする
 |---|---|---|
 | `STT_BACKCHANNEL_MAX_SESSIONS` | `4` | 同時に相槌を予測できる発話の数。超えた発話は相槌なしで受け付ける。1 以上の整数 |
 | `STT_STREAM_MAX_UTTERANCE_SECONDS` | `60` | 1 発話の音声の上限（秒）。正の数 |
-| `STT_BACKCHANNEL_THRESHOLD` | `0.5` | 相槌を出す確率のしきい値。0 より大きく 1 以下 |
+| `STT_STREAM_RECORDING_DIR` | (空) | 相槌を予測した発話の音声と確率を保存するディレクトリ（下の「発話の録音」）。`~` はサーバを動かすユーザのホーム。空なら保存しない |
+| `STT_BACKCHANNEL_TIMING` | `maai` | 相槌のタイミングの決め方。`maai` または `silence` |
+| `STT_BACKCHANNEL_THRESHOLD` | `0.5` | 相槌を出す確率のしきい値（`maai`）。0 より大きく 1 以下 |
+| `STT_BACKCHANNEL_SILENCE_MS` | `90` | 相槌を出すまでに待つ無音の長さ（`silence`、ミリ秒）。32 以上の整数 |
 | `STT_BACKCHANNEL_MIN_INTERVAL_MS` | `1500` | 相槌を出してから、次の相槌を出せるまでの最短の間隔（ミリ秒）。0 以上の整数 |
 | `STT_BACKCHANNEL_PHRASES` | `うん,うんうん,はい,なるほど` | 相槌の文言の候補（カンマ区切り）。1 つ以上 |
 | `STT_ACK_OLLAMA_URL` | `http://127.0.0.1:11434` | 一時的な返事を作る Ollama の URL |
@@ -240,7 +249,9 @@ haas で extras が入っていない場合、理由は
 | フィールド | 型・範囲 | 省略時 |
 |---|---|---|
 | `phrases` | 文字列（1〜20 文字）の配列、1〜10 個 | `STT_BACKCHANNEL_PHRASES` |
-| `threshold` | 数値、0 より大きく 1 以下 | `STT_BACKCHANNEL_THRESHOLD` |
+| `timing` | `maai` / `silence` | `STT_BACKCHANNEL_TIMING` |
+| `threshold` | 数値、0 より大きく 1 以下。`timing` が `maai` のときだけ使う | `STT_BACKCHANNEL_THRESHOLD` |
+| `silence_ms` | 整数、32〜2,000。`timing` が `silence` のときだけ使う | `STT_BACKCHANNEL_SILENCE_MS` |
 | `min_interval_ms` | 整数、0〜60,000 | `STT_BACKCHANNEL_MIN_INTERVAL_MS` |
 | `phrases_by_kind` | 話の種類（下表）から文言への対応、1〜14 個。文言は 1〜20 文字の文字列、または 1〜5 個の配列 | 指定しない（`phrases` を順に使う） |
 
@@ -316,15 +327,38 @@ haas で extras が入っていない場合、理由は
 
 #### 相槌の決め方
 
-- 予測モデルは 100ms ごとに「今、相槌を打つべき確率」を出す。
-- 確率がしきい値（`backchannel.threshold`、省略時は `STT_BACKCHANNEL_THRESHOLD`）を下から上へ
+タイミングは `backchannel.timing`（省略時は `STT_BACKCHANNEL_TIMING`）で決める。
+
+- `maai`：予測モデル（MaAI `vap_bc_jp`）は 100ms ごとに「今、相槌を打つべき確率」を出す。
+  確率がしきい値（`backchannel.threshold`、省略時は `STT_BACKCHANNEL_THRESHOLD`）を下から上へ
   超えたフレームで 1 回だけ相槌を出す（超えている間に何度も出さない）。
+- `silence`：Silero VAD が 32ms ごとに「話していない確率」を出し、0.5 以上を無音とみなす。
+  最後に話したフレームから無音が `backchannel.silence_ms`（省略時は `STT_BACKCHANNEL_SILENCE_MS`）
+  以上続いたフレームで相槌を出す。
+  - 1 つの無音では 1 回だけ出し、次は話し手がまた話してから出す。発話の先頭の無音
+    （クライアントが話し始めの前から送る音声）では、まだ何も話していないため出さない。
+  - 無音になった最初のフレームで、話の種類の判定を先に始める（`phrases_by_kind` のとき）。
+    無音を待つ時間に判定の時間を重ねるため。途中で話し始めたら、その判定は使わない。
+  - `backchannel` イベントの `probability` は、相槌を出したフレームの話していない確率。
+  - ARGOS の音声（4 発話、200ms 以上の切れ目 27 個）では、`maai` は相槌 10 回がすべて話の途中で
+    出たのに対し、`silence`（90ms）は 23 回のうち 20 回が切れ目の中に出た。切れ目の始まりからの
+    遅れは中央値 211ms（Silero VAD は話し終わりから無音と判定するまでに 60〜90ms かかる）。
+    RMS（音量）で無音を判定しないのは、車内のロードノイズなどで声と雑音の大きさが近いと
+    誤判定が増えるため（人工の低域雑音で SNR 10dB にすると、誤反応が 5 回から 20 回に増えた。
+    Silero VAD は SNR 0dB でも 3 回）。
 - 前の相槌から最短の間隔（`backchannel.min_interval_ms`、省略時は `STT_BACKCHANNEL_MIN_INTERVAL_MS`）
   が経っていなければ出さない。`offset_ms`（音声上の時刻）で測る。
 - `phrases_by_kind` を指定しない発話では、文言（`backchannel.phrases`、省略時は
   `STT_BACKCHANNEL_PHRASES`）を順に使う。同じ文言が続かないようにするため。
 - `phrases_by_kind` を指定した発話では、相槌を出すと決めたフレームまでの音声を文字起こしし、
   Kev（判断だけを返すモデル。`/v1/systemone`）に話の種類を 1 つ選ばせ、その種類の文言を返す。
+  - `maai` では、確率がしきい値の 2/3 を下から上へ超えたフレームで、そのフレームまでの音声で判定を先に始める。
+    同じ山（確率がしきい値の 2/3 以上のまま続く区間）でしきい値を超えたら、その判定の結果を使う。
+    確率はしきい値に届く 1〜2 フレーム前から上がり始めるため、途中の文字起こしと判定の時間
+    （100〜150ms）だけ相槌が遅れて話の続きにかぶるのを避けられる。
+  - 先に始めた判定は 1 回の相槌にだけ使う。しきい値を超えずに山が終わったときと、1 つのフレームで
+    しきい値まで上がったときは、相槌を出すと決めたフレームまでの音声で判定し直す。
+    最短の間隔の中では、判定を先に始めない。
   - Kev に渡すのは、途中までの文字起こしの最後の文（句点・疑問符・感嘆符で区切る）。
     文末まで届いていない場合は最後の断片を使う。過去の文の質問や言いよどみで、
     現在話している内容の種類を変えないため。
@@ -337,9 +371,32 @@ haas で extras が入っていない場合、理由は
     `SerialTranscriber` の順番待ちを抜けて GPU 上の推論が重なるため。結果は捨てる。
   - 話の種類を判定しても相槌を出さなかったときも、最短の間隔は数える。
   - 起動スクリプトは `scripts/logging.json` で `stt_gateway` の INFO ログを有効にする。
-    種類別相槌の送信・見送りごとに発話番号、音声位置、種類、所要時間、理由を残す。
+    種類別相槌の送信・見送りごとに発話番号、音声位置、種類、理由、先に始めた判定を使ったか
+    （`prepared`）、相槌を出すと決めてからの待ち時間を残す。
     理由は `sent`、`unmapped_kind`、`timeout`、`judge_unavailable`、`closed`。
     発話本文と認証トークンは含めない。
+- 相槌の予測をした発話では、発話の終わりに、フレーム数・確率の最大値・確率の山を 1 行のログに残す
+  （`backchannel probabilities`）。山は、確率 0.15 以上が続いた区間ごとの最大のフレームで、
+  「音声位置ms:確率」の並びで書く。クライアントのマイクの音で、確率がどこまで上がるかを見て
+  しきい値を決めるため。
+
+#### 発話の録音
+
+`STT_STREAM_RECORDING_DIR` を指定したときだけ、相槌を予測した発話（`end`・上限超過・切断で
+終わったもの）ごとに 2 つのファイルを保存する。ログの山だけでは、確率が上がらない理由
+（マイクの音、話し方）を切り分けられないため、音声と毎フレームの確率を突き合わせられるようにする。
+
+- ファイル名は `<発話の開始時刻 YYYYMMDD-HHMMSS-マイクロ秒>-u<utterance_id>` に `.wav` / `.json` を付ける。
+  接続ごとに `utterance_id` は 1 から数え直すため、時刻で重ならないようにする。
+- `.wav`：受け取った音声をデコードした 16kHz モノラル 16bit。予測器と文字起こしに渡したものと同じ。
+- `.json`：`utterance_id`、`recorded_at`（発話の開始時刻）、`sample_rate_hz`、`duration_ms`、
+  `timing`（`maai` なら `threshold` と `prepare_threshold`、`silence` なら `silence_ms` も入る）、
+  `min_interval_ms`、`frames`（毎フレームの `offset_ms` と `probability`。`silence` では話していない確率）、`prepares`（判定を先に始めたフレーム）、`fires`（相槌を出すと決めたフレームと
+  `has_prepared`）。話の種類と送ったかどうかは、同じ `offset_ms` の `backchannel decision` のログで分かる。
+- 予測が残りの音声を処理し終えてから保存する。保存は別スレッドで行い、失敗しても発話の処理は続け、
+  ログに保存先と一緒に残す。
+- 録音には話した内容がそのまま入るため、ディレクトリは `0700`、ファイルは `0600` で作る。
+  古いファイルは自動では消さない。
 
 #### 一時的な返事の作り方
 
@@ -424,7 +481,8 @@ Haas-ja の出力は「、」はある程度付くが「。」はほとんど付
 
 1. 接続時に認証を確認する。
 2. `start` を受けたら、発話の音声バッファを用意し、`backchannel_pool.py` から予測器を借りて
-   状態を初期化し、`started` を返す。
+   状態を初期化し、`started` を返す。予測器は `timing` ごとに別の貸し出し元から借りる
+   （`maai` は MaAI、`silence` は Silero VAD）。上限はどちらも `STT_BACKCHANNEL_MAX_SESSIONS`。
    - 予測器は発話の間だけ借り、`end` または切断で返す。接続したまま話していないクライアントが
      枠を握り続けないため。
    - 状態を初期化するのは、前の発話の文脈を次の発話の予測に持ち越さないため。
@@ -443,8 +501,8 @@ Haas-ja の出力は「、」はある程度付くが「。」はほとんど付
      ユーザの音声と同じ長さの無音を渡す。
    - 予測器は別スレッドで推論し、結果をイベントループへ渡す。推論中も音声の受信を止めない。
    - 相槌を出すかどうかは `backchannel_policy.py` が決める（2.4 の「相槌の決め方」）。
-   - `phrases_by_kind` を指定した発話では、相槌を出すと決めるたびに、途中の文字起こしと話の種類の
-     判定を別のタスクで行う。予測の処理はその完了を待たずに続ける。
+   - `phrases_by_kind` を指定した発話では、判定を先に始めるときと相槌を出すと決めたときに、
+     途中の文字起こしと話の種類の判定を別のタスクで行う。予測の処理はその完了を待たずに続ける。
 4. `end` を受けたら、その発話の予測器への入力を止め、バッファを WAV の一時ファイルに書き出して
    `SerialTranscriber` で文字起こしする。`/transcribe` と同じ順番待ちに入るため、GPU 上の推論が
    重ならない。一時ファイルは成否にかかわらず削除する。
@@ -470,7 +528,7 @@ Haas-ja の出力は「、」はある程度付くが「。」はほとんど付
 |---|---|
 | 必須 | fastapi、uvicorn、pydantic、python-multipart、python-dotenv、faster-whisper、av、numpy、websockets、httpx、nvidia-cublas-cu12（Linux） |
 | extras `haas` | haas-asr（GitHub のコミット固定）、torch 2.14.0。Python 3.11 以上かつ Linux のみ |
-| extras `stream` | maai。`/stream` で相槌を出す場合だけ必要 |
+| extras `stream` | maai、silero-vad。`/stream` で相槌を出す場合だけ必要 |
 | 外部サービス | Ollama（一時的な返事を作る LLM）。`/stream` を使う場合だけ必要 |
 | 外部サービス | Kev（[jaredpalmer/kev](https://github.com/jaredpalmer/kev)、Apache-2.0。Kev-0.8B を GPU で約 1.9GB）。`phrases_by_kind` を使う場合だけ必要 |
 
@@ -482,6 +540,11 @@ Haas-ja の出力は「、」はある程度付くが「。」はほとんど付
 - **maai の依存**：maai は GUI やマイク入力用の PyQt5・pygame・pyaudio と、transformers==5.5.3 を
   必須にしている。相槌の予測ではどれも使わないが、extras `stream` に入れると一緒に入る。
   transformers は `override-dependencies` の下限（5.10.0 以上）が優先される。
+- **silero-vad**：同梱の ONNX モデル（`silero_vad/data/silero_vad.onnx`、MIT）を onnxruntime で
+  直接動かす。パッケージの推論関数は torch のテンソルを受け渡すが、1 チャンクごとに呼ぶため
+  numpy のまま渡す。必須の依存は torch と packaging で、torch は maai のために入っている。
+  faster-whisper にも Silero VAD のモデルが同梱されているが、音声全体をまとめて判定する形で、
+  1 チャンクずつ状態を引き継いで呼ぶと確率が silero-vad と最大 0.83 ずれたため使わない。
 - **`uv sync` は extras を指定し直す**：`uv sync` は指定しなかった extras のパッケージを削除する。
   haas と stream を両方使う環境では `uv sync --extra haas --extra stream` とする。
   `scripts/run_server.sh` の `uv run` は余分なパッケージを削除しないため、入れた extras は残る。
@@ -537,6 +600,11 @@ Kev は `127.0.0.1` だけで待ち受け、`KEV_API_KEY` で Bearer 認証を�
 - メッセージの順序の誤り（発話中の `start` など）と、各 `error` の `code`
 - 1 発話で `started` → `backchannel` → `transcript` → `ack` の順にイベントが届くこと
 - 相槌の決め方（しきい値の立ち上がり、最短の間隔、文言の順番、`end` 後の予測を送らないこと）
+- 判定を先に始める合図と、その結果を同じ山の相槌でだけ使うこと。確率の山のまとめ方
+- `silence` の決め方（無音が続いたら出す、1 つの無音で 1 回、先頭の無音で出さない、話し始めたら準備を捨てる）と、
+  `timing: "silence"` の発話で MaAI を使わないこと。Silero VAD の予測器は実際のモデルで、32ms ごとの位置と、
+  無音を話していないと判定することを確かめる
+- 録音を有効にした発話で、音声と毎フレームの確率・合図が保存されること、保存の失敗で止まらないこと
 - `start` の `ack`・`backchannel` の指定が使われること、省略した項目がサーバの設定になること、
   範囲外の指定が `invalid_message` になること、`ack: false` で ack を送らないこと
 - 一時的な返事の整形と、タイムアウト・接続失敗・文字数超過のときの固定文言への差し替え

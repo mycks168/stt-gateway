@@ -24,7 +24,7 @@ from stt_gateway.transcription import Transcription
 _ACK_SETTINGS = AckSettings(
     "http://ollama.test", "gemma4:e2b", 1000, 20, "ちょっと確認するね。", "30m"
 )
-_BACKCHANNEL_SETTINGS = BackchannelSettings(1, 0.5, 0, ("うん",))
+_BACKCHANNEL_SETTINGS = BackchannelSettings(1, "maai", 0.5, 120, 0, ("うん",))
 _ONE_FRAME_PCM = samples_to_pcm_s16le(np.zeros(1600, dtype=np.float32))
 
 
@@ -99,6 +99,7 @@ def _session(
     dependencies = StreamDependencies(
         serial_transcriber=SerialTranscriber(_FixedTranscriber),
         backchannel_pool=pool,
+        silence_pool=pool,
         ack_generator=AckGenerator(_ACK_SETTINGS, client),
         backend=BackendDescription("whisper", "large-v3-turbo", "auto", "int8_float16"),
         default_language="ja",

@@ -7,13 +7,14 @@ import logging
 import time
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import numpy as np
 from pydantic import ValidationError
 
 from .ack_generator import AckGenerator, AckRequest
 from .audio_decoding import AudioSamples
-from .backchannel_policy import BackchannelKind, BackchannelTrigger, PhraseRotation
+from .backchannel_policy import BackchannelKind, PhraseRotation
 from .backchannel_pool import BackchannelPool, LeasedPredictor, PredictorRefusal
 from .backchannel_stream import (
     BackchannelEmitter,
@@ -24,6 +25,7 @@ from .backchannel_stream import (
     RotationEmitter,
     samples_until_offset,
 )
+from .backchannel_triggers import BackchannelTiming, ProbabilityTiming, create_trigger
 from .backends import BackendDescription
 from .config import AckSettings, BackchannelSettings
 from .sample_transcription import transcribe_samples
@@ -54,6 +56,7 @@ from .stream_options import (
     resolve_backchannel_rule,
 )
 from .transcription import Transcription
+from .utterance_recording import UtteranceRecorder, UtteranceRecording
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +71,7 @@ class StreamDependencies:
 
     serial_transcriber: SerialTranscriber
     backchannel_pool: BackchannelPool
+    silence_pool: BackchannelPool
     ack_generator: AckGenerator
     backend: BackendDescription
     default_language: str
@@ -75,6 +79,15 @@ class StreamDependencies:
     backchannel: BackchannelSettings
     ack: AckSettings
     kind_judging: KindJudging | None
+    recorder: UtteranceRecorder | None = None
+
+
+@dataclass(frozen=True)
+class _BackchannelRun:
+    """発話の相槌の予測と、その決め方。"""
+
+    stream: BackchannelStream
+    rule: BackchannelRule
 
 
 @dataclass
@@ -85,13 +98,21 @@ class _ReceivingUtterance:
     language: str
     decoder: StreamAudioDecoder
     ack_request: AckRequest | None
-    backchannel: BackchannelStream | None = None
+    started_at: datetime
+    backchannel: _BackchannelRun | None = None
     chunks: list[AudioSamples] = field(default_factory=list)
     sample_count: int = 0
 
     def samples_until(self, offset_ms: int) -> AudioSamples:
         """受け取った音声の先頭から offset_ms までを返す。"""
         return samples_until_offset(self.chunks, offset_ms)
+
+    def all_samples(self) -> AudioSamples:
+        """受け取った音声すべてを 1 つの波形にする。"""
+        if not self.chunks:
+            return np.zeros(0, dtype=np.float32)
+        samples: AudioSamples = np.concatenate(self.chunks)
+        return samples
 
 
 @dataclass(frozen=True)
@@ -168,7 +189,7 @@ class StreamSession:
             await self._discard_too_long(utterance)
             return
         if utterance.backchannel is not None:
-            utterance.backchannel.feed(samples)
+            utterance.backchannel.stream.feed(samples)
 
     async def close(self) -> None:
         """切断時の後始末。受け取り途中の発話は文字起こしせずに捨てる。
@@ -176,8 +197,8 @@ class StreamSession:
         文字起こし中のタスクは止めない。推論のスレッドは途中で止められず、待たずに止めると
         SerialTranscriber の順番待ちを抜けて、GPU 上の推論が重なってしまうため。
         """
-        if isinstance(self._current, _ReceivingUtterance) and self._current.backchannel is not None:
-            self._current.backchannel.close()
+        if isinstance(self._current, _ReceivingUtterance):
+            self._close_backchannel(self._current)
         self._current = None
 
     async def wait_for_background_tasks(self) -> None:
@@ -212,15 +233,18 @@ class StreamSession:
             language,
             create_stream_audio_decoder(message.encoding),
             resolve_ack_request(message.ack, self._dependencies.ack),
+            datetime.now().astimezone(),
         )
         plan = self._plan_phrasing(rule.phrasing)
         lease = (
             PredictorRefusal("unavailable")
             if plan is None
-            else await self._dependencies.backchannel_pool.acquire()
+            else await self._pool_for(rule.timing).acquire()
         )
         if isinstance(lease, LeasedPredictor) and plan is not None:
-            utterance.backchannel = self._start_backchannel(utterance, lease, rule, plan)
+            utterance.backchannel = _BackchannelRun(
+                self._start_backchannel(utterance, lease, rule, plan), rule
+            )
         self._current = utterance
         await self._sender.send(
             StartedEvent(
@@ -231,6 +255,12 @@ class StreamSession:
                 else lease.reason,
             )
         )
+
+    def _pool_for(self, timing: BackchannelTiming) -> BackchannelPool:
+        """タイミングの決め方に合う予測器の貸し出し元を返す。"""
+        if isinstance(timing, ProbabilityTiming):
+            return self._dependencies.backchannel_pool
+        return self._dependencies.silence_pool
 
     def _plan_phrasing(
         self, phrasing: RotationPhrasing | KindPhrasing
@@ -253,8 +283,8 @@ class StreamSession:
         return BackchannelStream(
             utterance.utterance_id,
             lease.predictor,
-            BackchannelTrigger(rule.threshold, rule.min_interval_ms),
-            self._dependencies.backchannel_pool,
+            create_trigger(rule.timing, rule.min_interval_ms),
+            self._pool_for(rule.timing),
             self._emitter_for(utterance, plan),
         )
 
@@ -303,11 +333,8 @@ class StreamSession:
         self._current = None
         if isinstance(utterance, _DiscardingUtterance):
             return
-        if utterance.backchannel is not None:
-            utterance.backchannel.close()
-        samples = (
-            np.concatenate(utterance.chunks) if utterance.chunks else np.zeros(0, dtype=np.float32)
-        )
+        self._close_backchannel(utterance)
+        samples = utterance.all_samples()
         self._spawn(
             self._finish(
                 _FinishedUtterance(
@@ -318,12 +345,38 @@ class StreamSession:
 
     async def _discard_too_long(self, utterance: _ReceivingUtterance) -> None:
         """上限を超えた発話を破棄し、end まで音声を捨てる。"""
-        if utterance.backchannel is not None:
-            utterance.backchannel.close()
+        self._close_backchannel(utterance)
         self._current = _DiscardingUtterance(utterance.utterance_id)
         await self._send_error(
             "utterance_too_long",
             f"utterance exceeds {self._dependencies.max_utterance_seconds:g} seconds",
+        )
+
+    def _close_backchannel(self, utterance: _ReceivingUtterance) -> None:
+        """相槌の予測を終える。録音する設定なら、予測が終わってから音声と確率を保存する。"""
+        run = utterance.backchannel
+        if run is None:
+            return
+        run.stream.close()
+        recorder = self._dependencies.recorder
+        if recorder is not None:
+            self._spawn(self._record(recorder, utterance, run))
+
+    async def _record(
+        self, recorder: UtteranceRecorder, utterance: _ReceivingUtterance, run: _BackchannelRun
+    ) -> None:
+        """予測のタスクが残りの音声を処理し終えるのを待ち、発話の音声と確率を保存する。"""
+        await run.stream.task
+        samples = utterance.all_samples()
+        await recorder.record(
+            UtteranceRecording(
+                utterance.utterance_id,
+                utterance.started_at,
+                samples,
+                run.rule.timing,
+                run.rule.min_interval_ms,
+                run.stream.trace(),
+            )
         )
 
     async def _finish(self, utterance: _FinishedUtterance) -> None:
