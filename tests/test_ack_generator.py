@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Callable, Coroutine
 
 import httpx
@@ -18,6 +19,7 @@ _SETTINGS = AckSettings(
     max_chars=20,
     fallback_text="ちょっと確認するね。",
     keep_alive="30m",
+    load_timeout_ms=1000,
 )
 
 _DEFAULT_REQUEST = AckRequest(DEFAULT_ACK_PROMPT, "ちょっと確認するね。", 20)
@@ -103,7 +105,59 @@ def test_generate_falls_back_when_ollama_is_unreachable(caplog: pytest.LogCaptur
     assert "http://ollama.test:11434/api/chat" in caplog.text, "ログに接続先を含めること"
 
 
-def test_warm_up_requests_once_and_ignores_failure(caplog: pytest.LogCaptureFixture) -> None:
+def _load_reply() -> httpx.Response:
+    """Ollama の読み込みだけの要求への応答を作る。"""
+    return httpx.Response(200, json={"model": "gemma4:e2b", "done": True, "done_reason": "load"})
+
+
+def test_preload_sends_load_only_request_and_logs_elapsed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        """リクエストを記録して、読み込み完了を返す。"""
+        requests.append(request)
+        return _load_reply()
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            generator = AckGenerator(_SETTINGS, client)
+            generator.request_preload()
+            generator.request_preload()  # 読み込み中は 2 本目を送らない
+            await asyncio.sleep(0.05)
+            await generator.close()
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(scenario())
+    assert len(requests) == 1
+    assert str(requests[0].url) == "http://ollama.test:11434/api/generate"
+    assert json.loads(requests[0].content) == {"model": "gemma4:e2b", "keep_alive": "30m"}
+    assert "ack model preloaded (model=gemma4:e2b, elapsed_ms=" in caplog.text
+
+
+def test_preload_continues_after_reply_times_out() -> None:
+    finished_paths: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        """読み込みも返事も、STT_ACK_TIMEOUT_MS より長くかかる状態を再現する。"""
+        await asyncio.sleep(0.4)
+        finished_paths.append(request.url.path)
+        return _load_reply() if request.url.path == "/api/generate" else _reply("調べるね。")
+
+    async def scenario() -> Ack:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            generator = AckGenerator(_SETTINGS, client)
+            generator.request_preload()
+            ack = await generator.generate("明日の天気は？", _DEFAULT_REQUEST)
+            await asyncio.sleep(0.4)
+            return ack
+
+    assert asyncio.run(scenario()).source == "fallback"
+    assert finished_paths == ["/api/generate"], "返事が時間切れでも、読み込みは最後まで待つこと"
+
+
+def test_preload_failure_is_logged_and_can_be_retried(caplog: pytest.LogCaptureFixture) -> None:
     requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -113,11 +167,38 @@ def test_warm_up_requests_once_and_ignores_failure(caplog: pytest.LogCaptureFixt
 
     async def scenario() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            await AckGenerator(_SETTINGS, client).warm_up()
+            generator = AckGenerator(_SETTINGS, client)
+            for _ in range(2):
+                generator.request_preload()
+                await asyncio.sleep(0.05)
 
     asyncio.run(scenario())
-    assert len(requests) == 1
-    assert "ack warm-up failed" in caplog.text
+    assert len(requests) == 2, "前の読み込みが終わっていれば、次の要求でまた読み込む"
+    assert "ack model preload failed (url=http://ollama.test:11434/api/generate" in caplog.text
+
+
+def test_close_cancels_preload_in_progress() -> None:
+    is_cancelled = asyncio.Event()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        """取り消されるまで読み込みを終えない。"""
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            is_cancelled.set()
+            raise
+        return _load_reply()
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            generator = AckGenerator(_SETTINGS, client)
+            generator.request_preload()
+            await asyncio.sleep(0.05)
+            await generator.close()
+            await generator.close()  # 終わった後に呼んでも何もしない
+
+    asyncio.run(scenario())
+    assert is_cancelled.is_set()
 
 
 def test_generate_uses_request_prompt_limit_and_fallback() -> None:

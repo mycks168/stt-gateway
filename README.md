@@ -68,6 +68,7 @@ ollama pull gemma4:e2b
 | `STT_ACK_MAX_CHARS` | `20` | 一時的な返事の文字数の上限 |
 | `STT_ACK_FALLBACK_TEXT` | `ちょっと確認するね。` | 一時的な返事を作れなかったときに返す文言 |
 | `STT_ACK_KEEP_ALIVE` | `30m` | Ollama がモデルを GPU に置いておく時間（Ollama の `keep_alive` の書式） |
+| `STT_ACK_LOAD_TIMEOUT_MS` | `60000` | Ollama にモデルを読み込ませるときに待つ上限（ミリ秒） |
 
 - `STT_BACKEND` に上記以外の値を書くと、サーバは起動しない。
 - モデルはサーバの起動時に読み込む。初回は Hugging Face Hub からダウンロードされ、
@@ -85,6 +86,9 @@ ollama pull gemma4:e2b
 - `/stream` 用の設定が範囲外の値だと、サーバは起動しない。
 - 一時的な返事のモデルは GPU メモリを使う（`gemma4:e2b` で約 1.7GB）。Ollama が動いていなくても
   `/stream` は使え、一時的な返事は `STT_ACK_FALLBACK_TEXT` になる。
+- 一時的な返事のモデルが GPU から外れていると、外れた後の最初の発話では一時的な返事が
+  `STT_ACK_FALLBACK_TEXT` になることがある（`gemma4:e2b` の読み込みに約 8〜15 秒かかる）。
+  次の発話からは LLM の返事に戻る。
 
 ## 起動
 ```bash

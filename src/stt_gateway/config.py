@@ -133,6 +133,7 @@ class AckSettings:
     max_chars: int
     fallback_text: str
     keep_alive: str
+    load_timeout_ms: int
 
 
 def load_backchannel_settings() -> BackchannelSettings:
@@ -168,6 +169,7 @@ def load_ack_settings() -> AckSettings:
         max_chars=_read_int("STT_ACK_MAX_CHARS", "20", minimum=1),
         fallback_text=_read_non_empty("STT_ACK_FALLBACK_TEXT", "ちょっと確認するね。"),
         keep_alive=_read_non_empty("STT_ACK_KEEP_ALIVE", "30m"),
+        load_timeout_ms=_read_int("STT_ACK_LOAD_TIMEOUT_MS", "60000", minimum=1),
     )
 
 

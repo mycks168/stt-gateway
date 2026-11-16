@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import tempfile
 import time
@@ -117,7 +116,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     http_client = create_http_client()
     ack_generator = AckGenerator(settings.ack, http_client)
     app.state.stream_dependencies = build_stream_dependencies(serial_transcriber, ack_generator)
-    ack_warm_up = asyncio.create_task(ack_generator.warm_up())
+    ack_generator.request_preload()
     try:
         await serial_transcriber.preload()
     except Exception:
@@ -128,7 +127,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        ack_warm_up.cancel()
+        await ack_generator.close()
         await http_client.aclose()
 
 

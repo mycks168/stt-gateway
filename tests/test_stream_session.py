@@ -22,7 +22,7 @@ from stt_gateway.stream_session import StreamDependencies, StreamSession
 from stt_gateway.transcription import Transcription
 
 _ACK_SETTINGS = AckSettings(
-    "http://ollama.test", "gemma4:e2b", 1000, 20, "ちょっと確認するね。", "30m"
+    "http://ollama.test", "gemma4:e2b", 1000, 20, "ちょっと確認するね。", "30m", 60000
 )
 _BACKCHANNEL_SETTINGS = BackchannelSettings(1, 32, 0, 0, 0, 1.0, 0, "", 0.0, 200, ("うん",))
 _ONE_FRAME_PCM = samples_to_pcm_s16le(np.zeros(1600, dtype=np.float32))
@@ -186,3 +186,34 @@ def test_prediction_failure_disables_backchannel_but_keeps_utterance(
     events = _run_utterance(predictor, speak_after_failure)
     assert [event.type for event in events] == ["started", "transcript", "ack"]
     assert "backchannel prediction failed" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("start_message", "expected_paths"),
+    [
+        ('{"type": "start", "encoding": "pcm_s16le"}', ["/api/generate"]),
+        ('{"type": "start", "encoding": "pcm_s16le", "ack": false}', []),
+    ],
+)
+def test_start_preloads_ack_model_only_when_ack_is_requested(
+    start_message: str, expected_paths: list[str]
+) -> None:
+    requested_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """要求の宛先を記録して、読み込み完了を返す。"""
+        requested_paths.append(request.url.path)
+        return httpx.Response(200, json={"done": True, "done_reason": "load"})
+
+    async def scenario() -> None:
+        predictor = _GatedPredictor()
+        predictor.gate.set()
+        pool = _ReleaseWatchingPool(predictor)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            session = _session(pool, _RecordingSender(), client)
+            await session.handle_text(start_message)
+            await asyncio.sleep(0.05)
+            await session.close()
+
+    asyncio.run(scenario())
+    assert requested_paths == expected_paths

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Literal
 
 import httpx
 from pydantic import BaseModel, ValidationError
 
-from .ack_prompt import DEFAULT_ACK_PROMPT, AckPrompt, build_ack_messages
+from .ack_prompt import AckPrompt, build_ack_messages
 from .ack_text import normalize_ack_text
 from .config import AckSettings
 
@@ -19,11 +20,12 @@ logger = logging.getLogger(__name__)
 AckSource = Literal["llm", "fallback"]
 
 OLLAMA_CHAT_PATH = "/api/chat"
+# prompt を付けない /api/generate は、推論せずにモデルの読み込みだけを行う。
+OLLAMA_LOAD_PATH = "/api/generate"
 # 思考モードは返事が遅くなるだけで、一言の相槌には不要。
 OLLAMA_THINK = False
 OLLAMA_TEMPERATURE = 0.3
 OLLAMA_MAX_OUTPUT_TOKENS = 40
-WARMUP_TEXT = "こんにちは"
 MILLISECONDS_PER_SECOND = 1000
 
 
@@ -63,6 +65,7 @@ class AckGenerator:
         """設定と、Ollama への接続に使う HTTP クライアントを受け取る。"""
         self._settings = settings
         self._client = client
+        self._preload_task: asyncio.Task[None] | None = None
 
     async def generate(self, transcript_text: str, request: AckRequest) -> Ack:
         """一時的な返事を作る。時間切れ・失敗・長すぎる場合は固定の文言を返す。"""
@@ -89,17 +92,45 @@ class AckGenerator:
             return self._fallback(request)
         return Ack(text, "llm")
 
-    async def warm_up(self) -> None:
-        """モデルを GPU に読み込ませておく。最初の返事がモデルの読み込みを待たないようにするため。"""
+    def request_preload(self) -> None:
+        """モデルの読み込みを裏で始める。読み込み中なら何もしない。
+
+        返事の要求は STT_ACK_TIMEOUT_MS で切断し、そのとき Ollama は読み込みも中止する。
+        読み込みを返事とは別の要求で最後まで待つことで、返事が時間切れでも次の返事に間に合わせる。
+        読み込み済みのモデルに送ると、すぐ終わり keep_alive が延びる。
+        """
+        if self._preload_task is not None and not self._preload_task.done():
+            return
+        self._preload_task = asyncio.create_task(self._preload())
+
+    async def close(self) -> None:
+        """読み込み中なら取り消して、終わるのを待つ。"""
+        task = self._preload_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def _preload(self) -> None:
+        """Ollama にモデルを読み込ませ、かかった時間をログに残す。失敗してもログに残すだけにする。"""
+        url = f"{self._settings.ollama_url}{OLLAMA_LOAD_PATH}"
+        started_at = time.perf_counter()
         try:
-            await self._request_reply(WARMUP_TEXT, DEFAULT_ACK_PROMPT)
-        except (httpx.HTTPError, ValidationError) as error:
-            logger.warning(
-                "ack warm-up failed (url=%s, model=%s): %r",
-                self._chat_url,
-                self._settings.model,
-                error,
+            response = await self._client.post(
+                url,
+                json={"model": self._settings.model, "keep_alive": self._settings.keep_alive},
+                timeout=self._settings.load_timeout_ms / MILLISECONDS_PER_SECOND,
             )
+            response.raise_for_status()
+        except httpx.HTTPError as error:
+            logger.warning(
+                "ack model preload failed (url=%s, model=%s): %r", url, self._settings.model, error
+            )
+            return
+        elapsed_ms = (time.perf_counter() - started_at) * MILLISECONDS_PER_SECOND
+        logger.info(
+            "ack model preloaded (model=%s, elapsed_ms=%.0f)", self._settings.model, elapsed_ms
+        )
 
     @property
     def _chat_url(self) -> str:

@@ -229,6 +229,9 @@ class StreamSession:
             resolve_ack_request(message.ack, self._dependencies.ack),
             datetime.now().astimezone(),
         )
+        if utterance.ack_request is not None:
+            # 話している間に読み込みを済ませ、発話の終わりの返事がモデルの読み込みを待たないようにする。
+            self._dependencies.ack_generator.request_preload()
         pacing = create_pacing(rule.timing, rule.interval)
         pool = self._dependencies.backchannel_pool
         lease = await pool.acquire()

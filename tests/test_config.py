@@ -45,6 +45,7 @@ _STREAM_ENV_NAMES = (
     "STT_ACK_MAX_CHARS",
     "STT_ACK_FALLBACK_TEXT",
     "STT_ACK_KEEP_ALIVE",
+    "STT_ACK_LOAD_TIMEOUT_MS",
     "STT_STREAM_MAX_UTTERANCE_SECONDS",
 )
 
@@ -80,6 +81,7 @@ def test_stream_settings_defaults() -> None:
     assert ack.max_chars == 20
     assert ack.fallback_text == "ちょっと確認するね。"
     assert ack.keep_alive == "30m"
+    assert ack.load_timeout_ms == 60000
     assert load_max_utterance_seconds() == 60.0
 
 
@@ -121,6 +123,7 @@ def test_backchannel_settings_reject_invalid_values(
     ("name", "value"),
     [
         ("STT_ACK_TIMEOUT_MS", "0"),
+        ("STT_ACK_LOAD_TIMEOUT_MS", "0"),
         ("STT_ACK_MAX_CHARS", "0"),
         ("STT_ACK_FALLBACK_TEXT", "  "),
         ("STT_ACK_MODEL", ""),

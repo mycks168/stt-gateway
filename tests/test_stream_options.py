@@ -22,7 +22,7 @@ from stt_gateway.stream_options import (
 )
 
 _ACK_DEFAULTS = AckSettings(
-    "http://ollama.test", "gemma4:e2b", 1500, 20, "ちょっと確認するね。", "30m"
+    "http://ollama.test", "gemma4:e2b", 1500, 20, "ちょっと確認するね。", "30m", 60000
 )
 _BACKCHANNEL_DEFAULTS = BackchannelSettings(
     4, 120, 1000, 1500, 3000, 1.1, 8000, "", 0.35, 200, ("うん", "はい")
