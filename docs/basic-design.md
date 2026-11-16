@@ -196,6 +196,8 @@ haas で extras が入っていない場合、理由は
 - `Authorization: Bearer <token>` ヘッダが必須。検証は `/transcribe` と同じ（`STT_API_KEY` が
   空のときはヘッダの有無だけを見る）。
 - ヘッダが無い、またはトークンが一致しない場合は、WebSocket を確立せず HTTP `403` で拒否する。
+- ブラウザの WebSocket API はヘッダを付けられないため、ブラウザからは直接接続できない。
+  トークンを URL のクエリで受け取らない理由は「5. 認証」のとおり。
 - 同時接続数に上限は設けない。相槌の予測ができないとき（下記）も接続は受け付け、
   その発話を相槌なしで扱う。`transcript` と `ack` はいつもどおり送る。
   - 同時に相槌を予測している発話が `STT_BACKCHANNEL_MAX_SESSIONS` に達している（`busy`）。
@@ -588,6 +590,13 @@ FastAPI の `HTTPBearer` で `Authorization` ヘッダを必須にし、`STT_API
 トークンは URL のクエリでは受け取らない。アクセスログやプロキシのログに残るため。
 
 ## 6. テスト
+
+実行方法：
+
+```bash
+uv sync --group dev
+uv run pytest --cov=stt_gateway
+```
 
 モデルはダミーに差し替え、GPU とモデル本体なしで実行する。`SerialTranscriber` は、
 同時に投げた推論が重ならないこと、推論中もイベントループが進むこと、読み込みの失敗を

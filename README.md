@@ -1,298 +1,95 @@
 # stt-gateway
 
-音声ファイルを受け取り、文字起こし結果を JSON で返す STT API サーバ。
-文字起こしエンジンは faster-whisper（多言語）と Haas-ja（日本語専用）から選べる。
+音声を文字起こしして返す API サーバ。ストリーミングでは、話している最中の相槌と、話し終えた直後の一時的な返事も返す。
 
-WebSocket（`/stream`）で音声をストリーミングで送ると、話している最中の相槌（「うん」「なるほど」）、
-発話の文字起こし結果、「〇〇ね、確認するね。」のような一時的な返事を順に返す。
+## 主な機能
 
-## 動作要件
-- Python 3.10 以上（Haas-ja を使う場合は 3.11 以上）
-- [uv](https://docs.astral.sh/uv/)
-- GPU を使う場合: NVIDIA ドライバ
-- Haas-ja を使う場合: Linux と NVIDIA GPU（CPU では動かない）。ディスクは追加で約 8GB 必要
-- `/stream` を使う場合: [Ollama](https://ollama.com/)（一時的な返事を作る）
+- **ファイルの文字起こし**（`POST /transcribe`）: 音声ファイル（WAV / Opus）を送ると、文字起こし結果を JSON で返す
+- **ストリーミングの文字起こし**（WebSocket `/stream`）: 話しながら音声を送ると、次の 3 つを順に返す
+  - **相槌**: 話の切れ目で「うん」「なるほど」などを返す。言いかけの途中では出さないようにもできる
+  - **文字起こし結果**: 話し終えたら、その発話の文字起こし結果を返す
+  - **一時的な返事**: 「〇〇ね、確認するね。」のような一言を返す。本回答が届くまでのつなぎに使う
+- **文字起こしエンジンの選択**: faster-whisper（多言語）と Haas-ja（日本語専用）のどちらかを使う
+- **Bearer トークンによる認証**
+- **複数のワーカー**による同時処理
 
-## セットアップ
-```bash
-uv sync
-cp .env.example .env
-```
+## 使用技術・必要な環境
 
-Haas-ja を使う場合は、追加の依存を入れて `.env` の `STT_BACKEND` を `haas` にする。
-```bash
-uv sync --extra haas
-```
-
-`/stream` で相槌を出す場合は、追加の依存を入れ、一時的な返事のモデルを Ollama に用意する。
-```bash
-uv sync --extra stream
-ollama pull gemma4:e2b
-```
-- extras を複数使う場合は、まとめて指定する（例: `uv sync --extra haas --extra stream`）。
-  1 つだけ指定して `uv sync` すると、指定しなかった extras は削除される。
-- extras `stream` が無くても `/stream` は使える。その場合は相槌が出ない。
-
-## 設定（.env）
-
-| 変数 | デフォルト | 説明 |
+| 用途 | 使用技術 | 必要な環境 |
 |---|---|---|
-| `STT_HOST` | `0.0.0.0` | バインドするアドレス |
-| `STT_PORT` | `23000` | ポート |
-| `STT_BACKEND` | `whisper` | 文字起こしエンジン。`whisper` / `haas` |
-| `STT_MODEL` | `large-v3-turbo` | faster-whisper のモデル名（whisper のみ） |
-| `STT_DEVICE` | `auto` | `auto` / `cuda` / `cpu`（whisper のみ） |
-| `STT_COMPUTE_TYPE` | `int8_float16` | `int8` / `int8_float16` / `float16` / `float32`（whisper のみ） |
-| `STT_HAAS_MODEL` | `third-intelligence/Haas-ja-v1.0` | Haas-ja のモデル（haas のみ） |
-| `STT_LANGUAGE` | `ja` | `language` 未指定時に使う言語 |
-| `STT_API_KEY` | (空) | Bearer トークン。空の場合はトークンの値を検証しない |
-| `STT_WORKERS` | `1` | 同時に文字起こしできる件数（ワーカープロセス数） |
-| `STT_MAX_REQUESTS` | `0` | 1 ワーカーがこの件数を処理したら、ワーカーを起動し直す。`0` で無効 |
-| `STT_MAX_REQUESTS_JITTER` | `0` | 起動し直すまでの件数を、ワーカーごとに 0〜この値だけずらす |
-| `STT_STREAM_MAX_UTTERANCE_SECONDS` | `60` | `/stream` の 1 発話の音声の上限（秒） |
-| `STT_STREAM_RECORDING_DIR` | (空) | 指定すると、相槌を出した `/stream` の発話ごとに、音声（`.wav`）と相槌の判定の記録（`.json`）をこのディレクトリに保存する。空なら保存しない。保存したファイルは自動では消えない |
-| `STT_BACKCHANNEL_MAX_SESSIONS` | `4` | 1 ワーカーで同時に相槌を出せる発話の数。超えた発話は相槌なしになる |
-| `STT_BACKCHANNEL_SILENCE_MS` | `90` | 相槌を出すまでに待つ無音の長さ（ミリ秒、32 以上） |
-| `STT_BACKCHANNEL_MIN_NEW_SPEECH_MS` | `1000` | 前の相槌（無ければ話し始め）から新しくこの長さ（ミリ秒）話すまで相槌を出さない |
-| `STT_BACKCHANNEL_MIN_INTERVAL_MS` | `1500` | 話し始めの、相槌と相槌の最短の間隔（ミリ秒） |
-| `STT_BACKCHANNEL_INTERVAL_PER_MINUTE_MS` | `3000` | 1 分話すごとに最短の間隔へ足す長さ（ミリ秒） |
-| `STT_BACKCHANNEL_INTERVAL_FACTOR` | `1.1` | 相槌を 1 回出すごとに最短の間隔を何倍にするか（1.0〜3.0） |
-| `STT_BACKCHANNEL_MAX_INTERVAL_MS` | `8000` | 伸ばした最短の間隔の上限（ミリ秒） |
-| `STT_BACKCHANNEL_BOUNDARY_MODEL` | (空) | 言いかけの途中で相槌を出さないために使う言語モデル（Hugging Face のモデル名か、モデルのディレクトリ）。空なら判定しない。extras `haas` が必要 |
-| `STT_BACKCHANNEL_BOUNDARY_THRESHOLD` | `0.35` | 相槌を出す「言い終わりの区切りらしさ」の下限（0〜1）。大きいほど相槌が減る。`0` で判定しない |
-| `STT_BACKCHANNEL_JUDGE_TIMEOUT_MS` | `200` | 区切りの判定（途中の文字起こしを含む）を待つ上限（ミリ秒）。間に合わなければ、その相槌は出さない |
-| `STT_BACKCHANNEL_PHRASES` | `うん,うんうん,はい,なるほど` | 相槌の文言（カンマ区切り）。順に使う |
-| `STT_ACK_OLLAMA_URL` | `http://127.0.0.1:11434` | 一時的な返事を作る Ollama の URL |
-| `STT_ACK_MODEL` | `gemma4:e2b` | 一時的な返事を作る Ollama のモデル |
-| `STT_ACK_TIMEOUT_MS` | `1500` | 一時的な返事を待つ上限（ミリ秒） |
-| `STT_ACK_MAX_CHARS` | `20` | 一時的な返事の文字数の上限 |
-| `STT_ACK_FALLBACK_TEXT` | `ちょっと確認するね。` | 一時的な返事を作れなかったときに返す文言 |
-| `STT_ACK_KEEP_ALIVE` | `30m` | Ollama がモデルを GPU に置いておく時間（Ollama の `keep_alive` の書式） |
-| `STT_ACK_LOAD_TIMEOUT_MS` | `60000` | Ollama にモデルを読み込ませるときに待つ上限（ミリ秒） |
+| サーバ本体 | Python・FastAPI・uvicorn | Python 3.10 以上、[uv](https://docs.astral.sh/uv/) |
+| 文字起こし（whisper） | faster-whisper（既定は `large-v3-turbo`） | GPU を使う場合は NVIDIA ドライバ |
+| 文字起こし（haas） | Haas-ja（NeMo） | Python 3.11 以上、Linux、NVIDIA GPU（CPU では動かない）、追加のディスク約 8GB |
+| 相槌のタイミング | Silero VAD | CPU で動く |
+| 言いかけの判定（任意） | Hugging Face の言語モデル（例: `Qwen/Qwen3.5-0.8B-Base`） | NVIDIA GPU（約 1.5GB） |
+| 一時的な返事 | [Ollama](https://ollama.com/)（既定は `gemma4:e2b`） | NVIDIA GPU（約 1.7GB） |
 
-- `STT_BACKEND` に上記以外の値を書くと、サーバは起動しない。
-- モデルはサーバの起動時に読み込む。初回は Hugging Face Hub からダウンロードされ、
-  `~/.cache/huggingface` にキャッシュされる。`large-v3-turbo` は約 1.6GB。
-  読み込みが終わるまで `/transcribe` は応答を待たせる。
-- ワーカーごとにモデルを読み込むため、GPU メモリも `STT_WORKERS` の数だけ必要になる
-  （haas は 1 ワーカーあたり最大約 3.6GB）。
-- 同時に来たリクエストが `STT_WORKERS` を超えると、空いたワーカーから順に処理する。
-  待っている間もエラーにはならない。
-- `STT_MAX_REQUESTS` の件数には `/health` も含まれる。起動し直しているワーカーは、
-  モデルを読み込み終えるまでリクエストを処理しない。
-- `STT_WORKERS=1` で `STT_MAX_REQUESTS` を使う場合は、systemd で常駐させる。
-  `scripts/run_server.sh` を直接実行していると、指定件数でサーバが終了したままになる。
-- `haas` では日本語（`ja`）しか文字起こしできない。
-- `/stream` 用の設定が範囲外の値だと、サーバは起動しない。
-- 一時的な返事のモデルは GPU メモリを使う（`gemma4:e2b` で約 1.7GB）。Ollama が動いていなくても
-  `/stream` は使え、一時的な返事は `STT_ACK_FALLBACK_TEXT` になる。
-- 一時的な返事のモデルが GPU から外れていると、外れた後の最初の発話では一時的な返事が
-  `STT_ACK_FALLBACK_TEXT` になることがある（`gemma4:e2b` の読み込みに約 8〜15 秒かかる）。
-  次の発話からは LLM の返事に戻る。
+GPU メモリはワーカーごとに必要になる（文字起こしのモデルは haas で 1 ワーカーあたり最大約 3.6GB）。
 
-## 起動
-```bash
-bash scripts/run_server.sh
+## 使い方
+
+ここでは最小の例だけを示す。リクエスト・イベント・エラーの仕様は [docs/basic-design.md](docs/basic-design.md) の「2. 外部仕様」を参照。
+
+### 使用例: 音声エージェントの前段として使う
+
+ユーザが話している間は相槌でつなぎ、話し終えたら文字起こし結果をエージェントに渡す。本回答ができるまでの間は、一時的な返事を読み上げて待たせる。
+
+```mermaid
+sequenceDiagram
+    actor User as ユーザ
+    participant Client as クライアント
+    participant Gateway as stt-gateway
+    participant Agent as エージェント
+
+    User->>Client: 話し始める
+    Client->>Gateway: start
+    Client->>Gateway: 音声「明日の会議ってさ、」
+    Note over User,Client: 少し黙る
+    Gateway-->>Client: backchannel「うん」
+    Client-->>User: 「うん」を再生
+    Client->>Gateway: 音声「何時からだっけ」
+    User->>Client: 話し終える
+    Client->>Gateway: end
+    Gateway-->>Client: transcript「明日の会議ってさ、何時からだっけ」
+    Gateway-->>Client: ack「明日の会議ね、確認するね。」
+    Client-->>User: 「明日の会議ね、確認するね。」を再生
+    Client->>Agent: 文字起こし結果を渡す
+    Agent-->>Client: 本回答
+    Client-->>User: 本回答を再生
 ```
 
-systemd で常駐させる場合:
-```bash
-sudo cp stt-gateway.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now stt-gateway
-sudo journalctl -u stt-gateway -f
-```
-`stt-gateway.service` は配置先を `/opt/stt-gateway` として定義している。別の場所に置く
-場合は `WorkingDirectory` と `EnvironmentFile` を書き換える。
+- 相槌は `start` から `end` の間だけ届く。
+- `ack` は必ず `transcript` の後に届く。
+- エージェントの呼び出しと音声の再生は、クライアントが行う。
 
-### 言いかけの途中で相槌を出さない
-
-言いかけの途中で相槌を出さないようにするには、`.env` に言語モデルを設定して gateway を再起動する
-（`uv sync --extra haas --extra stream` が必要。GPU を約 1.5GB 使う）。モデルは、gateway の実行ユーザーが
-読める場所を指定する。Hugging Face のモデル名を指定すると、最初の起動でダウンロードする。
-
-```dotenv
-STT_BACKCHANNEL_BOUNDARY_MODEL=Qwen/Qwen3.5-0.8B-Base
-```
-
-```bash
-sudo systemctl restart stt-gateway
-```
-
-設定すると、相槌の数はおおむね半分以下に減る。
-
-## API
-
-### GET /health
-認証不要。
+### 動作確認（認証不要）
 
 ```bash
 curl http://127.0.0.1:23000/health
 ```
-```json
-{
-  "ok": true,
-  "backend": "whisper",
-  "model": "large-v3-turbo",
-  "device": "auto",
-  "compute_type": "int8_float16"
-}
-```
 
-### POST /transcribe
-`multipart/form-data`。`Authorization: Bearer <token>` ヘッダが必須で、ヘッダが無い場合は
-`401` を返す。`STT_API_KEY` が空のときはトークンの値を検証しない。
+### ファイルを文字起こしする
 
-| パラメータ | 必須 | 説明 |
-|---|---|---|
-| `file` | ○ | 音声ファイル |
-| `language` | | 言語コード。省略時は `STT_LANGUAGE` |
-
-#### 対応フォーマット
-ファイルの拡張子で判定する。ファイル名または拡張子が無い場合は `.wav` として扱う。
-
-| 拡張子 | 内容 |
-|---|---|
-| `.wav` | WAV（無圧縮） |
-| `.ogg` / `.opus` | Opus（Ogg コンテナ） |
-| `.webm` | Opus（WebM コンテナ） |
-
-#### リクエスト例
 ```bash
 curl -X POST http://127.0.0.1:23000/transcribe \
   -H "Authorization: Bearer YOUR_TOKEN" \
-  -F "file=@/tmp/sample.opus" \
+  -F "file=@sample.opus" \
   -F "language=ja"
 ```
 
-#### レスポンス
 ```json
-{
-  "ok": true,
-  "text": "こんにちは",
-  "language": "ja",
-  "duration": 1.23,
-  "latency_ms": 240,
-  "backend": "whisper",
-  "model": "large-v3-turbo"
-}
+{"ok": true, "text": "こんにちは", "language": "ja", "duration": 1.23,
+ "latency_ms": 240, "backend": "whisper", "model": "large-v3-turbo"}
 ```
 
-`latency_ms` は、ほかのリクエストの処理を待った時間を含む。
+- 対応する拡張子は `.wav` / `.ogg` / `.opus` / `.webm`。拡張子が無い場合は `.wav` として扱う。
+- `language` を省略すると `STT_LANGUAGE` を使う。haas では `ja` しか指定できない。
+- `latency_ms` には、ほかのリクエストの処理を待った時間も含まれる。
 
-| ステータス | 条件 | `detail` |
-|---|---|---|
-| `400` | 対応外の拡張子 | `unsupported audio format: '.mp4' (allowed: .ogg, .opus, .wav, .webm)` |
-| `400` | `haas` で `ja` 以外の言語を指定 | `unsupported language for backend 'haas': 'en' (supported: ja)` |
-| `401` | ヘッダが無い | `Not authenticated` |
-| `401` | トークンが一致しない | `invalid_token` |
-| `500` | モデルの読み込みまたは文字起こしに失敗 | `transcribe_failed: <理由>` |
+### ストリーミングで文字起こしする
 
-### WebSocket /stream
-`Authorization: Bearer <token>` ヘッダが必須（`/transcribe` と同じ）。ヘッダが無い、またはトークンが
-一致しない場合は、接続できない（HTTP `403`）。ブラウザの WebSocket はヘッダを付けられないため使えない。
+1 つの接続で、`start` → 音声（バイナリ）→ `end` を発話ごとに繰り返す。
 
-1 つの接続で、発話を 1 つずつ順に送れる。
-
-#### クライアントから送るもの
-| 種類 | 形式 | 内容 |
-|---|---|---|
-| 発話の開始 | テキスト（JSON） | `{"type": "start", "encoding": "opus", "language": "ja"}`。`type` 以外は省略できる（省略時は `opus` と `STT_LANGUAGE`）。一時的な返事と相槌の指定（`ack`・`backchannel`）も付けられる（下記） |
-| 音声 | バイナリ | `encoding` が `opus` なら Opus のパケット 1 つ（Ogg などのコンテナに入れない）。`pcm_s16le` なら 16kHz・モノラル・16bit リトルエンディアンの PCM |
-| 発話の終了 | テキスト（JSON） | `{"type": "end"}` |
-
-- Opus はモノラルで送る。フレーム長・ビットレート・エンコード時のサンプリングレートは自由。
-  パケットは 1 つずつ、エンコードした順に送る。
-- 言語は `ja` だけ。
-- `end` を送ったら、結果を待たずに次の `start` を送ってよい。
-
-#### 一時的な返事と相槌を発話ごとに指定する
-`start` に `ack` と `backchannel` を付けると、その発話だけサーバの設定の代わりに使う。
-省略した項目はサーバの設定のまま。
-
-例：この後に別の本回答が続くクライアント向けに、相手の言葉を繰り返さない一言にする。
-```json
-{"type": "start", "encoding": "opus",
- "ack": {
-   "system_prompt": "あなたは会話の聞き手です。相手の話を聞いて、相槌を一言だけ打ちます。あなたは答えを知らないので、質問や依頼には答えず「ちょっと見てみるね」「考えるね」のように受け止めるだけにします。相手の言葉は繰り返しません。聞き返しもしません。日本語で、15文字以内、くだけた口調、1文だけ。",
-   "examples": [
-     {"user": "明日の天気ってどう？", "reply": "ちょっと見てみるね。"},
-     {"user": "なんか最近調子悪いんだよね", "reply": "そっか、ちょっと考えるね。"},
-     {"user": "この関数どこで呼ばれてるんだっけ", "reply": "うん、探してみる。"},
-     {"user": "お疲れさま、今日はもういいよ", "reply": "うん、お疲れさま！"}
-   ],
-   "fallback_text": "えっと、ちょっと待ってね。"
- },
- "backchannel": {"phrases": ["うん", "うんうん"], "silence_ms": 120, "min_interval_ms": 1200}}
-```
-
-| フィールド | 範囲 | 省略時 |
-|---|---|---|
-| `ack.system_prompt` | 1〜2,000 文字 | 既定のプロンプト（相手の言葉を少し繰り返して受け止める） |
-| `ack.examples` | `user`（1〜200 文字）と `reply`（1〜100 文字）の組、0〜8 個 | `system_prompt` も省略したときは既定の例、`system_prompt` を指定したときは例なし |
-| `ack.fallback_text` | 1〜50 文字 | `STT_ACK_FALLBACK_TEXT` |
-| `ack.max_chars` | 1〜100 | `STT_ACK_MAX_CHARS` |
-| `backchannel.phrases` | 1〜20 文字の文言、1〜10 個 | `STT_BACKCHANNEL_PHRASES` |
-| `backchannel.silence_ms` | 32〜2,000 | `STT_BACKCHANNEL_SILENCE_MS` |
-| `backchannel.min_new_speech_ms` | 0〜10,000 | `STT_BACKCHANNEL_MIN_NEW_SPEECH_MS` |
-| `backchannel.min_interval_ms` | 0〜60,000 | `STT_BACKCHANNEL_MIN_INTERVAL_MS` |
-| `backchannel.interval_per_minute_ms` | 0〜60,000 | `STT_BACKCHANNEL_INTERVAL_PER_MINUTE_MS` |
-| `backchannel.interval_factor` | 1.0〜3.0 | `STT_BACKCHANNEL_INTERVAL_FACTOR` |
-| `backchannel.max_interval_ms` | 0〜60,000 | `STT_BACKCHANNEL_MAX_INTERVAL_MS` |
-| `backchannel.boundary_threshold` | 0〜1 | `STT_BACKCHANNEL_BOUNDARY_THRESHOLD` |
-
-- 相槌は、話していない状態（Silero VAD で判定）が `silence_ms` 続いたところで出す。
-  話し始める前の無音では出さず、1 つの切れ目では 1 回だけ出す。文言は `phrases` を順に使い、
-  順番は接続の中で引き継ぐ。`backchannel` イベントの `probability` は、話していない確率。
-- 相槌と相槌の間は、話し始めは `min_interval_ms` 空け、話が続くほど（1 分ごとに
-  `interval_per_minute_ms` 足す）・相槌を重ねるほど（1 回ごとに `interval_factor` 倍）広げる。
-  広げた間隔は `max_interval_ms` を超えない（`min_interval_ms` より小さい場合は `min_interval_ms`）。
-  広げないときは `interval_per_minute_ms` を 0、`interval_factor` を 1.0 にする。
-  間隔は送った相槌から数える。出さなかった相槌（下の区切りの判定で黙ったものなど）では数え直さない。
-- `STT_BACKCHANNEL_BOUNDARY_MODEL` を設定したサーバでは、話し手が言いかけの途中（「なので」
-  「〜の方で」など）で止まったところでは相槌を出さない。途中までの文字起こしの「言い終わりの
-  区切りらしさ」が `boundary_threshold` より小さいと出さない。`0` を指定した発話では判定しない。
-- 前の相槌（無ければ話し始め）から新しく `min_new_speech_ms` 話すまで相槌を出さない。
-  同じ言葉のまま間が空いただけのところで、もう一度出さないため。
-- `"ack": false` にすると、その発話では一時的な返事が届かない。
-- 範囲外の値や知らないフィールドがあると `invalid_message` が届き、その発話は始まらない。
-- 一時的な返事を作るモデルは、クライアントからは変えられない（`STT_ACK_MODEL`）。
-- プロンプトは「会話の聞き手」として書き出し、「答えを知らない」「日本語で」を入れる。
-  「アシスタント」や「つなぎ役」として書くと、質問に答えて事実でない内容を言い切ったり、
-  日本語以外で返したりすることがある（`gemma4:e2b` で確認）。
-
-区切りの判定を使ったサーバでは、相槌の候補ごとの送信・見送りが INFO ログに残る（起動スクリプトを使う場合）。
-`reason=sent` は送信、`not_boundary` は言いかけの途中、`timeout` は時間切れ、
-`judge_unavailable` は途中の文字起こしが得られなかった、`closed` は発話終了後を表す。
-音声位置・区切りらしさ（`boundary`）・判定の所要時間も記録し、発話本文は記録しない。
-
-#### サーバから届くもの（テキスト・JSON）
-| `type` | 届くとき | 主なフィールド |
-|---|---|---|
-| `started` | `start` を受け付けたとき | `utterance_id`、`backchannel`（この発話で相槌が出るか）、`backchannel_unavailable_reason`（出ない理由。`busy`: 混雑、`unavailable`: 相槌のモデルが使えない） |
-| `backchannel` | 話している最中、相槌を打つタイミング | `text`、`offset_ms`（発話の先頭からの位置）、`probability` |
-| `transcript` | `end` の後 | `text`、`language`、`duration`、`latency_ms`、`backend`、`model`（`/transcribe` と同じ意味） |
-| `ack` | `transcript` の後 | `text`、`source`（`llm`: LLM が作った、`fallback`: 固定の文言）、`latency_ms` |
-| `error` | 下表 | `code`、`detail` |
-
-- すべてに `utterance_id`（接続ごとに 1 から振る発話の番号）が付く。
-- 1 つの発話では `transcript` が先、`ack` が後に届く。
-- 相槌は `start` から `end` までの間だけ届く。
-- 文字起こし結果が空のとき、または `"ack": false` のときは `ack` は届かない。
-
-| `code` | 条件 |
-|---|---|
-| `invalid_message` | JSON として読めない、`type` や `encoding` が不明、`ack`・`backchannel` の指定が範囲外 |
-| `invalid_audio` | Opus のパケットをデコードできない、PCM のバイト数が奇数 |
-| `invalid_state` | 発話中に `start`、発話中でないときに音声や `end` |
-| `unsupported_language` | `ja` 以外の言語 |
-| `utterance_too_long` | 1 発話が `STT_STREAM_MAX_UTTERANCE_SECONDS` を超えた。その発話は捨てられ、`end` まで音声は無視される |
-| `transcribe_failed` | 文字起こしに失敗した。その発話の `ack` は届かない |
-
-`error` が届いても接続は切れない。ワーカーの入れ替え（`STT_MAX_REQUESTS`）のときは、接続が
-クローズコード `1012` で切れるので、接続し直す。
-
-#### 例（Python）
 ```python
 import asyncio, json
 import websockets
@@ -301,19 +98,136 @@ async def main(opus_packets: list[bytes]) -> None:
     headers = {"Authorization": "Bearer YOUR_TOKEN"}
     async with websockets.connect("ws://127.0.0.1:23000/stream", additional_headers=headers) as ws:
         await ws.send(json.dumps({"type": "start", "encoding": "opus"}))
-        for packet in opus_packets:  # 20ms ごとにマイクからエンコードしたパケット
+        for packet in opus_packets:  # マイクからエンコードした Opus のパケットを 1 つずつ
             await ws.send(packet)
         await ws.send(json.dumps({"type": "end"}))
         async for message in ws:
             event = json.loads(message)
-            print(event)
+            print(event)  # started → backchannel（話している間）→ transcript → ack の順に届く
             if event["type"] in ("ack", "error"):
                 break
 ```
 
-## テスト
+- 音声は Opus のパケット（コンテナなし・モノラル）か、16kHz・モノラル・16bit の PCM（`"encoding": "pcm_s16le"`）で送る。
+- 言語は `ja` だけに対応する。
+- ブラウザの WebSocket は `Authorization` ヘッダを付けられないため、ブラウザからは直接つなげない。
+- 一時的な返事や相槌の言い方は、`start` に `ack`・`backchannel` を付けると発話ごとに変えられる。`"ack": false` にすると一時的な返事を返さない。
+- ワーカーが入れ替わるとき（`STT_MAX_REQUESTS`）は、接続がクローズコード `1012` で切れる。接続し直す。
+
+## セットアップ手順
+
+### 1. 基本（whisper で文字起こしする）
+
 ```bash
-uv sync --group dev
-uv run pytest --cov=stt_gateway
+uv sync
+cp .env.example .env   # STT_API_KEY などを設定する
+bash scripts/run_server.sh
 ```
-GPU とモデル本体、Ollama は不要。カバレッジが 80% を下回るとテストが失敗する。
+
+モデルは起動時に読み込む。初回は Hugging Face Hub からダウンロードして `~/.cache/huggingface` に保存する（`large-v3-turbo` は約 1.6GB）。読み込みが終わるまで、リクエストは応答を待たされる。
+
+### 2. 機能を追加する（任意）
+
+使う機能の extras を**まとめて**指定して `uv sync` する。`uv sync` は、指定しなかった extras を削除する。
+
+| 追加する機能 | extras | ほかに必要な作業 |
+|---|---|---|
+| Haas-ja で文字起こしする | `haas` | `.env` で `STT_BACKEND=haas` にする |
+| `/stream` で相槌を出す | `stream` | なし |
+| 言いかけの途中で相槌を出さない | `haas` と `stream` | `.env` で `STT_BACKCHANNEL_BOUNDARY_MODEL` を設定する |
+| `/stream` で一時的な返事を作る | なし | Ollama を動かし、`ollama pull gemma4:e2b` でモデルを用意する |
+
+例: すべての機能を使う場合
+
+```bash
+uv sync --extra haas --extra stream
+ollama pull gemma4:e2b
+```
+
+- extras `stream` が無くても `/stream` は使えるが、相槌は出ない。
+- Ollama が動いていなくても `/stream` は使えるが、一時的な返事は `STT_ACK_FALLBACK_TEXT` の固定の文言になる。
+
+### 3. systemd で常駐させる
+
+```bash
+sudo cp stt-gateway.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now stt-gateway
+sudo journalctl -u stt-gateway -f
+```
+
+`stt-gateway.service` は配置先を `/opt/stt-gateway` としている。別の場所に置く場合は `WorkingDirectory` と `EnvironmentFile` を書き換える。`.env` を変えたら `sudo systemctl restart stt-gateway` で反映する。
+
+## 環境変数・設定
+
+`.env` に書く。範囲外の値を書くと、サーバは起動しない。
+
+### サーバ
+
+| 変数 | デフォルト | 説明 |
+|---|---|---|
+| `STT_HOST` | `0.0.0.0` | バインドするアドレス |
+| `STT_PORT` | `23000` | ポート |
+| `STT_API_KEY` | (空) | Bearer トークン。空の場合はトークンの値を検証しない（ヘッダは必要） |
+| `STT_WORKERS` | `1` | ワーカープロセス数（同時に文字起こしできる件数） |
+| `STT_MAX_REQUESTS` | `0` | 1 ワーカーがこの件数（`/health` を含む）を処理したら、ワーカーを起動し直す。`0` で無効 |
+| `STT_MAX_REQUESTS_JITTER` | `0` | 起動し直すまでの件数を、ワーカーごとに 0〜この値だけずらす |
+
+- `STT_WORKERS` を超えたリクエストは、エラーにならず空いたワーカーを待つ。
+- `STT_WORKERS=1` で `STT_MAX_REQUESTS` を使う場合は、systemd で常駐させる。`scripts/run_server.sh` を直接実行していると、指定した件数でサーバが終了したままになる。
+
+### 文字起こし
+
+| 変数 | デフォルト | 説明 |
+|---|---|---|
+| `STT_BACKEND` | `whisper` | 文字起こしエンジン。`whisper` / `haas` |
+| `STT_LANGUAGE` | `ja` | `language` を省略したときの言語 |
+| `STT_MODEL` | `large-v3-turbo` | faster-whisper のモデル名（whisper のみ） |
+| `STT_DEVICE` | `auto` | `auto` / `cuda` / `cpu`（whisper のみ） |
+| `STT_COMPUTE_TYPE` | `int8_float16` | `int8` / `int8_float16` / `float16` / `float32`（whisper のみ） |
+| `STT_HAAS_MODEL` | `third-intelligence/Haas-ja-v1.0` | Haas-ja のモデル（haas のみ） |
+
+### ストリーミング（`/stream`）
+
+| 変数 | デフォルト | 説明 |
+|---|---|---|
+| `STT_STREAM_MAX_UTTERANCE_SECONDS` | `60` | 1 発話の音声の上限（秒） |
+| `STT_STREAM_RECORDING_DIR` | (空) | 指定すると、相槌を出した発話ごとに音声（`.wav`）と相槌の判定の記録（`.json`）を保存する。保存したファイルは自動では消えない |
+
+### 相槌
+
+相槌は、話し手が `STT_BACKCHANNEL_SILENCE_MS` 黙ったところで出す。話が長くなるほど、相槌を重ねるほど、相槌どうしの間隔を広げる。
+
+| 変数 | デフォルト | 説明 |
+|---|---|---|
+| `STT_BACKCHANNEL_PHRASES` | `うん,うんうん,はい,なるほど` | 相槌の文言（カンマ区切り）。順に使う |
+| `STT_BACKCHANNEL_SILENCE_MS` | `90` | 相槌を出すまでに待つ無音の長さ（ミリ秒、32 以上） |
+| `STT_BACKCHANNEL_MIN_NEW_SPEECH_MS` | `1000` | 前の相槌（無ければ話し始め）から新しくこの長さ（ミリ秒）話すまで、相槌を出さない |
+| `STT_BACKCHANNEL_MIN_INTERVAL_MS` | `1500` | 話し始めの、相槌と相槌の最短の間隔（ミリ秒） |
+| `STT_BACKCHANNEL_INTERVAL_PER_MINUTE_MS` | `3000` | 1 分話すごとに、最短の間隔へ足す長さ（ミリ秒） |
+| `STT_BACKCHANNEL_INTERVAL_FACTOR` | `1.1` | 相槌を 1 回出すごとに、最短の間隔を何倍にするか（1.0〜3.0） |
+| `STT_BACKCHANNEL_MAX_INTERVAL_MS` | `8000` | 広げた最短の間隔の上限（ミリ秒） |
+| `STT_BACKCHANNEL_BOUNDARY_MODEL` | (空) | 言いかけの途中で相槌を出さないために使う言語モデル（Hugging Face のモデル名か、モデルのディレクトリ）。空なら判定しない |
+| `STT_BACKCHANNEL_BOUNDARY_THRESHOLD` | `0.35` | 相槌を出す「言い終わりらしさ」の下限（0〜1）。大きいほど相槌が減る。`0` で判定しない |
+| `STT_BACKCHANNEL_JUDGE_TIMEOUT_MS` | `200` | 言いかけの判定を待つ上限（ミリ秒）。間に合わなければ、その相槌は出さない |
+| `STT_BACKCHANNEL_MAX_SESSIONS` | `4` | 1 ワーカーで同時に相槌を出せる発話の数。超えた発話は相槌なしになる |
+
+- `STT_BACKCHANNEL_BOUNDARY_MODEL` には、gateway の実行ユーザーが読める場所を指定する。Hugging Face のモデル名を指定した場合は、最初の起動時にダウンロードする。設定すると、相槌の数はおおむね半分以下に減る（例: `Qwen/Qwen3.5-0.8B-Base`）。
+
+### 一時的な返事
+
+| 変数 | デフォルト | 説明 |
+|---|---|---|
+| `STT_ACK_OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama の URL |
+| `STT_ACK_MODEL` | `gemma4:e2b` | 一時的な返事を作る Ollama のモデル |
+| `STT_ACK_TIMEOUT_MS` | `1500` | 一時的な返事を待つ上限（ミリ秒） |
+| `STT_ACK_MAX_CHARS` | `20` | 一時的な返事の文字数の上限 |
+| `STT_ACK_FALLBACK_TEXT` | `ちょっと確認するね。` | 一時的な返事を作れなかったときに返す文言 |
+| `STT_ACK_KEEP_ALIVE` | `30m` | Ollama がモデルを GPU に置いておく時間（Ollama の `keep_alive` の書式） |
+| `STT_ACK_LOAD_TIMEOUT_MS` | `60000` | Ollama にモデルを読み込ませるときに待つ上限（ミリ秒） |
+
+- モデルが GPU から外れていると、外れた後の最初の発話では、一時的な返事が `STT_ACK_FALLBACK_TEXT` になることがある（`gemma4:e2b` の読み込みに約 8〜15 秒かかる）。次の発話からは LLM の返事に戻る。
+
+## ライセンス
+
+[MIT License](LICENSE)
