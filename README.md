@@ -9,7 +9,7 @@
   - **相槌**: 話の切れ目で「うん」「なるほど」などを返す。言いかけの途中では出さないようにもできる
   - **文字起こし結果**: 話し終えたら、その発話の文字起こし結果を返す
   - **一時的な返事**: 「〇〇ね、確認するね。」のような一言を返す。本回答が届くまでのつなぎに使う
-- **文字起こしエンジンの選択**: faster-whisper（多言語）と Haas-ja（日本語専用）のどちらかを使う
+- **文字起こしエンジンの切り替え**: faster-whisper（多言語）と Haas-ja（日本語専用）を、リクエストごとに選べる
 - **Bearer トークンによる認証**
 - **複数のワーカー**による同時処理
 
@@ -84,7 +84,9 @@ curl -X POST http://127.0.0.1:23000/transcribe \
 
 - 対応する拡張子は `.wav` / `.ogg` / `.opus` / `.webm`。拡張子が無い場合は `.wav` として扱う。
 - `language` を省略すると `STT_LANGUAGE` を使う。haas では `ja` しか指定できない。
+- `backend`（`whisper` / `haas`）で文字起こしエンジンを選べる（例: `-F "backend=whisper"`）。省略すると `STT_BACKEND` を使う。選べるのは `STT_ENABLED_BACKENDS` に入れたエンジンだけ。
 - `latency_ms` には、ほかのリクエストの処理を待った時間も含まれる。
+- `STT_BACKEND` 以外のエンジンを初めて指定したリクエストは、モデルの読み込みを待つ（whisper で数秒、haas で約 10 秒）。
 
 ### ストリーミングで文字起こしする
 
@@ -111,6 +113,7 @@ async def main(opus_packets: list[bytes]) -> None:
 - 音声は Opus のパケット（コンテナなし・モノラル）か、16kHz・モノラル・16bit の PCM（`"encoding": "pcm_s16le"`）で送る。
 - 言語は `ja` だけに対応する。
 - ブラウザの WebSocket は `Authorization` ヘッダを付けられないため、ブラウザからは直接つなげない。
+- 文字起こしエンジンは、`start` に `backend` を付けると発話ごとに選べる。whisper を選ぶと、`transcript` と `ack` が haas より 0.2〜0.35 秒ほど遅れて届く。相槌は、どちらを選んでも変わらない。
 - 一時的な返事や相槌の言い方は、`start` に `ack`・`backchannel` を付けると発話ごとに変えられる。`"ack": false` にすると一時的な返事を返さない。
 - ワーカーが入れ替わるとき（`STT_MAX_REQUESTS`）は、接続がクローズコード `1012` で切れる。接続し直す。
 
@@ -133,6 +136,7 @@ bash scripts/run_server.sh
 | 追加する機能 | extras | ほかに必要な作業 |
 |---|---|---|
 | Haas-ja で文字起こしする | `haas` | `.env` で `STT_BACKEND=haas` にする |
+| リクエストで whisper と Haas-ja を切り替える | `haas` | `.env` で `STT_ENABLED_BACKENDS=whisper,haas` にする |
 | `/stream` で相槌を出す | `stream` | なし |
 | 言いかけの途中で相槌を出さない | `haas` と `stream` | `.env` で `STT_BACKCHANNEL_BOUNDARY_MODEL` を設定する |
 | `/stream` で一時的な返事を作る | なし | Ollama を動かし、`ollama pull gemma4:e2b` でモデルを用意する |
@@ -180,12 +184,16 @@ sudo journalctl -u stt-gateway -f
 
 | 変数 | デフォルト | 説明 |
 |---|---|---|
-| `STT_BACKEND` | `whisper` | 文字起こしエンジン。`whisper` / `haas` |
+| `STT_BACKEND` | `whisper` | 指定が無いときに使う文字起こしエンジン。`whisper` / `haas` |
+| `STT_ENABLED_BACKENDS` | (空) | リクエストで選べるエンジン（カンマ区切り、例: `whisper,haas`）。`STT_BACKEND` を含める。空なら `STT_BACKEND` だけ |
 | `STT_LANGUAGE` | `ja` | `language` を省略したときの言語 |
 | `STT_MODEL` | `large-v3-turbo` | faster-whisper のモデル名（whisper のみ） |
 | `STT_DEVICE` | `auto` | `auto` / `cuda` / `cpu`（whisper のみ） |
 | `STT_COMPUTE_TYPE` | `int8_float16` | `int8` / `int8_float16` / `float16` / `float32`（whisper のみ） |
 | `STT_HAAS_MODEL` | `third-intelligence/Haas-ja-v1.0` | Haas-ja のモデル（haas のみ） |
+
+- 起動時に読み込むのは `STT_BACKEND` のモデルだけ。ほかのエンジンのモデルは初めて指定されたときに読み込み、その後は GPU に置いたままにする。
+- `STT_BACKCHANNEL_BOUNDARY_MODEL` を設定していて、`STT_ENABLED_BACKENDS` に `haas` が入っている場合は、相槌の判定に使うため haas のモデルも起動時に読み込む。
 
 ### ストリーミング（`/stream`）
 

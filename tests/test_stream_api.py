@@ -21,10 +21,11 @@ from stream_helpers import encode_opus_packets, sine_wave
 from stt_gateway import server, stream_api
 from stt_gateway.audio_decoding import AudioSamples
 from stt_gateway.backchannel_policy import BackchannelFrame
+from stt_gateway.backend_selection import BackendSelection
 from stt_gateway.config import BackchannelSettings, Settings
 from stt_gateway.config import settings as base_settings
 from stt_gateway.pcm_audio import samples_to_pcm_s16le
-from stt_gateway.transcription import Transcription
+from stt_gateway.transcription import BackendName, Transcription
 
 _AUTH_HEADERS = {"Authorization": "Bearer dummy-token-for-tests"}
 _ACK_TEXT = "天気ね、確認するね。"
@@ -94,7 +95,7 @@ _TEST_BACKCHANNEL = BackchannelSettings(
 )
 # ローカルの .env に依存しないよう、どのテストでも whisper バックエンド・認証無効・日本語にする。
 _TEST_SETTING_CHANGES: dict[str, Any] = {
-    "backend": "whisper",
+    "backends": BackendSelection("whisper", ("whisper",)),
     "api_key": "",
     "language": "ja",
     "backchannel": _TEST_BACKCHANNEL,
@@ -119,7 +120,7 @@ def transcriber(monkeypatch: pytest.MonkeyPatch) -> _RecordingTranscriber:
     """設定に依存せず、whisper バックエンド・認証無効・ダミーの部品で動かす。"""
     fake = _RecordingTranscriber()
     _patch_settings(monkeypatch)
-    monkeypatch.setattr(server, "load_transcriber", lambda _settings: fake)
+    monkeypatch.setattr(server, "load_transcriber", lambda _settings, _backend: fake)
     # 本物の Silero VAD を読み込まず、100ms 話して 100ms 黙る音声として扱う。
     monkeypatch.setattr(server, "create_silero_predictor", lambda: _ScriptedPredictor([0.1, 0.9]))
 
@@ -658,3 +659,65 @@ def test_stream_does_not_judge_when_client_disables_boundary(
         websocket.send_bytes(_pcm(0.2))
         assert websocket.receive_json()["type"] == "backchannel"
     assert judged_texts == [], "0 を指定した発話では区切りを判定しない"
+
+
+def test_stream_judges_with_haas_and_transcribes_with_requested_backend(
+    transcriber: _RecordingTranscriber, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_boundary_judge(monkeypatch, lambda _text: 0.9)
+    _patch_settings(
+        monkeypatch,
+        backends=BackendSelection("whisper", ("whisper", "haas")),
+        backchannel=dataclasses.replace(_TEST_BACKCHANNEL, boundary_model="test/boundary-model"),
+    )
+    fakes = {"whisper": transcriber, "haas": _RecordingTranscriber()}
+    loaded: list[str] = []
+
+    def load(_settings: Settings, backend: BackendName) -> _RecordingTranscriber:
+        """エンジンごとのダミーを返し、読み込んだ順を記録する。"""
+        loaded.append(backend)
+        return fakes[backend]
+
+    monkeypatch.setattr(server, "load_transcriber", load)
+    with (
+        TestClient(server.app) as client,
+        client.websocket_connect("/stream", headers=_AUTH_HEADERS) as websocket,
+    ):
+        assert loaded == ["whisper", "haas"], "判定に使う haas も起動時に読み込むこと"
+        _start(websocket, encoding="pcm_s16le", backchannel={"boundary_threshold": 0.35})
+        websocket.send_bytes(_pcm(0.2))
+        assert websocket.receive_json()["type"] == "backchannel"
+        websocket.send_json({"type": "end"})
+        transcript = websocket.receive_json()
+    assert transcript["backend"] == "whisper"
+    assert transcript["model"] == base_settings.model
+    assert fakes["haas"].sample_counts == [3200], "途中の文字起こしは haas で行うこと"
+    assert transcriber.sample_counts == [3200], "発話の文字起こしは指定のエンジンで行うこと"
+
+
+def test_stream_uses_backend_given_in_start(
+    transcriber: _RecordingTranscriber, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_settings(monkeypatch, backends=BackendSelection("whisper", ("whisper", "haas")))
+    with (
+        TestClient(server.app) as client,
+        client.websocket_connect("/stream", headers=_AUTH_HEADERS) as websocket,
+    ):
+        _start(websocket, encoding="pcm_s16le", backend="haas")
+        websocket.send_bytes(_pcm(0.1))
+        websocket.send_json({"type": "end"})
+        transcript = websocket.receive_json()
+    assert transcript["backend"] == "haas"
+    assert transcript["model"] == base_settings.haas_model
+
+
+def test_stream_rejects_backend_that_is_not_enabled(client: TestClient) -> None:
+    with client.websocket_connect("/stream", headers=_AUTH_HEADERS) as websocket:
+        websocket.send_json({"type": "start", "backend": "haas"})
+        assert websocket.receive_json() == {
+            "type": "error",
+            "utterance_id": None,
+            "code": "unsupported_backend",
+            "detail": "unsupported backend: 'haas' (enabled: whisper)",
+        }
+        assert _start(websocket, encoding="pcm_s16le")["utterance_id"] == 1

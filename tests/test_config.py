@@ -4,27 +4,56 @@ from pathlib import Path
 
 import pytest
 
+from stt_gateway.backend_selection import BackendSelection
 from stt_gateway.config import (
     BackchannelSettings,
     load_ack_settings,
     load_backchannel_settings,
+    load_backend_selection,
     load_max_utterance_seconds,
     load_stream_recording_dir,
     parse_backend,
+    parse_backend_selection,
 )
 
 
 @pytest.mark.parametrize("value", ["whisper", "haas"])
 def test_parse_backend_accepts_known_backends(value: str) -> None:
-    assert parse_backend(value) == value
+    assert parse_backend("STT_BACKEND", value) == value
 
 
 def test_parse_backend_rejects_unknown_backend() -> None:
     with pytest.raises(ValueError) as exc_info:
-        parse_backend("Haas")
+        parse_backend("STT_BACKEND", "Haas")
     message = str(exc_info.value)
+    assert "STT_BACKEND" in message
     assert "'Haas'" in message
     assert "whisper, haas" in message
+
+
+def test_backend_selection_defaults_to_only_the_default_backend() -> None:
+    assert parse_backend_selection("haas", "") == BackendSelection("haas", ("haas",))
+
+
+def test_backend_selection_reads_enabled_backends() -> None:
+    selection = parse_backend_selection("haas", " haas , whisper ,haas")
+    assert selection == BackendSelection("haas", ("haas", "whisper"))
+
+
+def test_backend_selection_must_include_default_backend() -> None:
+    with pytest.raises(ValueError, match="must include STT_BACKEND 'haas'"):
+        parse_backend_selection("haas", "whisper")
+
+
+def test_backend_selection_rejects_unknown_enabled_backend() -> None:
+    with pytest.raises(ValueError, match="invalid STT_ENABLED_BACKENDS: 'kotoba'"):
+        parse_backend_selection("whisper", "whisper,kotoba")
+
+
+def test_load_backend_selection_reads_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STT_BACKEND", "whisper")
+    monkeypatch.setenv("STT_ENABLED_BACKENDS", "whisper,haas")
+    assert load_backend_selection() == BackendSelection("whisper", ("whisper", "haas"))
 
 
 _STREAM_ENV_NAMES = (

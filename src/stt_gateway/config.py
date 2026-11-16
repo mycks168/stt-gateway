@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import get_args
 
 from dotenv import load_dotenv
 
@@ -14,21 +13,44 @@ from .backchannel_interval import (
     MIN_BACKCHANNEL_INTERVAL_FACTOR,
 )
 from .backchannel_policy import MIN_BACKCHANNEL_SILENCE_MS
+from .backend_selection import BACKEND_NAMES, BackendSelection, parse_backend_name
 from .transcription import BackendName
 
 load_dotenv(override=False)
 
-BACKEND_NAMES: tuple[BackendName, ...] = get_args(BackendName)
-
 DEFAULT_BACKCHANNEL_PHRASES = "うん,うんうん,はい,なるほど"
 
 
-def parse_backend(value: str) -> BackendName:
-    """STT_BACKEND の値を検証する。誤記のまま別のバックエンドで起動しないよう ValueError にする。"""
-    for backend in BACKEND_NAMES:
-        if value == backend:
-            return backend
-    raise ValueError(f"invalid STT_BACKEND: '{value}' (allowed: {', '.join(BACKEND_NAMES)})")
+def parse_backend(name: str, value: str) -> BackendName:
+    """エンジンの名前を検証する。誤記のまま別のエンジンで起動しないよう ValueError にする。"""
+    backend = parse_backend_name(value)
+    if backend is None:
+        raise ValueError(f"invalid {name}: '{value}' (allowed: {', '.join(BACKEND_NAMES)})")
+    return backend
+
+
+def parse_backend_selection(default_raw: str, enabled_raw: str) -> BackendSelection:
+    """STT_BACKEND と STT_ENABLED_BACKENDS の値から、使えるエンジンを決める。
+
+    STT_ENABLED_BACKENDS が空なら、既定のエンジンだけを使う。
+    """
+    default = parse_backend("STT_BACKEND", default_raw.strip())
+    names = [name.strip() for name in enabled_raw.split(",") if name.strip()]
+    if not names:
+        return BackendSelection(default, (default,))
+    enabled = tuple(dict.fromkeys(parse_backend("STT_ENABLED_BACKENDS", name) for name in names))
+    if default not in enabled:
+        raise ValueError(
+            f"invalid STT_ENABLED_BACKENDS: '{enabled_raw}' (must include STT_BACKEND '{default}')"
+        )
+    return BackendSelection(default, enabled)
+
+
+def load_backend_selection() -> BackendSelection:
+    """使えるエンジンを環境変数から読む。"""
+    return parse_backend_selection(
+        os.getenv("STT_BACKEND", "whisper"), os.getenv("STT_ENABLED_BACKENDS", "")
+    )
 
 
 def _read_int(name: str, default: str, minimum: int) -> int:
@@ -195,7 +217,7 @@ class Settings:
 
     host: str = os.getenv("STT_HOST", "0.0.0.0")
     port: int = int(os.getenv("STT_PORT", "23000"))
-    backend: BackendName = parse_backend(os.getenv("STT_BACKEND", "whisper"))
+    backends: BackendSelection = field(default_factory=load_backend_selection)
     model: str = os.getenv("STT_MODEL", "large-v3-turbo")
     device: str = os.getenv("STT_DEVICE", "auto")
     compute_type: str = os.getenv("STT_COMPUTE_TYPE", "int8_float16")

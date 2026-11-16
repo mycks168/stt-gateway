@@ -23,6 +23,7 @@ StreamErrorCode = Literal[
     "invalid_audio",
     "invalid_state",
     "unsupported_language",
+    "unsupported_backend",
     "utterance_too_long",
     "transcribe_failed",
 ]
@@ -103,13 +104,18 @@ class BackchannelOptions(_StrictOptions):
 
 
 class StartMessage(BaseModel):
-    """クライアントからの発話の開始。ack が False ならその発話では一時的な返事を作らない。"""
+    """クライアントからの発話の開始。ack が False ならその発話では一時的な返事を作らない。
+
+    backend は文字起こし結果に使うエンジン。知らない名前も受け取り、使えるかどうかは
+    サーバの設定と合わせて判定する（unsupported_language と同じく unsupported_backend にするため）。
+    """
 
     model_config = ConfigDict(extra="ignore")
 
     type: Literal["start"]
     encoding: AudioEncoding = "opus"
     language: str | None = None
+    backend: str | None = None
     ack: AckOptions | Literal[False] | None = None
     backchannel: BackchannelOptions | None = None
 

@@ -1,4 +1,4 @@
-"""設定に応じて文字起こしバックエンドを選ぶ。"""
+"""文字起こしエンジンの情報を求め、モデルを読み込む。"""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ HAAS_COMPUTE_TYPE = "bfloat16"
 
 @dataclass(frozen=True)
 class BackendDescription:
-    """/health で返す、使用中のバックエンドとモデルの情報。"""
+    """/health や文字起こし結果で返す、エンジンとモデルの情報。"""
 
     backend: BackendName
     model: str
@@ -22,16 +22,16 @@ class BackendDescription:
     compute_type: str
 
 
-def describe_backend(settings: Settings) -> BackendDescription:
-    """モデルを読み込まずに、設定から使用中のバックエンドの情報を求める。"""
-    if settings.backend == "haas":
+def describe_backend(settings: Settings, backend: BackendName) -> BackendDescription:
+    """モデルを読み込まずに、設定から指定したエンジンの情報を求める。"""
+    if backend == "haas":
         return BackendDescription("haas", settings.haas_model, HAAS_DEVICE, HAAS_COMPUTE_TYPE)
     return BackendDescription("whisper", settings.model, settings.device, settings.compute_type)
 
 
-def load_transcriber(settings: Settings) -> Transcriber:
-    """設定されたバックエンドのモデルを読み込む。重い依存は選ばれた側だけ import する。"""
-    if settings.backend == "haas":
+def load_transcriber(settings: Settings, backend: BackendName) -> Transcriber:
+    """指定したエンジンのモデルを読み込む。重い依存は選ばれた側だけ import する。"""
+    if backend == "haas":
         from .haas_backend import load_haas_transcriber
 
         return load_haas_transcriber(settings.haas_model)

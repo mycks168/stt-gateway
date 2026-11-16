@@ -59,7 +59,7 @@ def load_haas_transcriber(model_name: str) -> HaasTranscriber:
         haas_asr = importlib.import_module("haas_asr")
     except ModuleNotFoundError as error:
         raise RuntimeError(
-            "STT_BACKEND=haas requires the 'haas' extra: run `uv sync --extra haas`"
+            "backend 'haas' requires the 'haas' extra: run `uv sync --extra haas`"
         ) from error
 
     model = haas_asr.load_model(model_name, device="cuda")

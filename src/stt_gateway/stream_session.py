@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -28,6 +28,7 @@ from .backchannel_policy import PhraseRotation
 from .backchannel_pool import BackchannelPool, LeasedPredictor
 from .backchannel_stream import BackchannelStream, recent_samples
 from .backchannel_triggers import create_pacing, create_trigger
+from .backend_selection import BackendSelection, UnsupportedBackendError, select_backend
 from .backends import BackendDescription
 from .config import AckSettings, BackchannelSettings
 from .sample_transcription import transcribe_samples
@@ -55,7 +56,7 @@ from .stream_options import (
     resolve_ack_request,
     resolve_backchannel_rule,
 )
-from .transcription import Transcription
+from .transcription import BackendName, Transcription
 from .utterance_recording import UtteranceRecorder, UtteranceRecording
 
 logger = logging.getLogger(__name__)
@@ -71,12 +72,16 @@ PARTIAL_TRANSCRIPTION_WINDOW_MS = 15_000
 
 @dataclass(frozen=True)
 class StreamDependencies:
-    """/stream の処理に必要な、ワーカー内で共有する部品と設定。"""
+    """/stream の処理に必要な、ワーカー内で共有する部品と設定。
+
+    backend_descriptions は、有効なエンジンごとの transcript に載せる情報。
+    """
 
     serial_transcriber: SerialTranscriber
     backchannel_pool: BackchannelPool
     ack_generator: AckGenerator
-    backend: BackendDescription
+    backends: BackendSelection
+    backend_descriptions: Mapping[BackendName, BackendDescription]
     default_language: str
     max_utterance_seconds: float
     backchannel: BackchannelSettings
@@ -93,12 +98,20 @@ class _BackchannelRun:
     rule: BackchannelRule
 
 
+@dataclass(frozen=True)
+class _UtteranceTarget:
+    """発話の言語と、文字起こし結果に使うエンジン。"""
+
+    language: str
+    backend: BackendName
+
+
 @dataclass
 class _ReceivingUtterance:
     """音声を受け取っている発話。"""
 
     utterance_id: UtteranceId
-    language: str
+    target: _UtteranceTarget
     decoder: StreamAudioDecoder
     ack_request: AckRequest | None
     started_at: datetime
@@ -130,7 +143,7 @@ class _FinishedUtterance:
     """end を受け取り、文字起こしと一時的な返事を作る発話。ack_request が None なら返事は作らない。"""
 
     utterance_id: UtteranceId
-    language: str
+    target: _UtteranceTarget
     samples: AudioSamples
     ack_request: AckRequest | None
 
@@ -212,19 +225,15 @@ class StreamSession:
                 "invalid_state", "start received while an utterance is in progress"
             )
             return
-        language = message.language or self._dependencies.default_language
-        if language not in SUPPORTED_LANGUAGES:
-            await self._send_error(
-                "unsupported_language",
-                f"unsupported language for stream: '{language}' (supported: {', '.join(SUPPORTED_LANGUAGES)})",
-            )
+        target = await self._resolve_target(message)
+        if target is None:
             return
         self._last_utterance_id += 1
         utterance_id = UtteranceId(self._last_utterance_id)
         rule = resolve_backchannel_rule(message.backchannel, self._dependencies.backchannel)
         utterance = _ReceivingUtterance(
             utterance_id,
-            language,
+            target,
             create_stream_audio_decoder(message.encoding),
             resolve_ack_request(message.ack, self._dependencies.ack),
             datetime.now().astimezone(),
@@ -255,6 +264,23 @@ class StreamSession:
             )
         )
 
+    async def _resolve_target(self, message: StartMessage) -> _UtteranceTarget | None:
+        """発話の言語とエンジンを決める。使えなければ error を送って None を返す。"""
+        language = message.language or self._dependencies.default_language
+        if language not in SUPPORTED_LANGUAGES:
+            await self._send_error(
+                "unsupported_language",
+                f"unsupported language for stream: '{language}' "
+                f"(supported: {', '.join(SUPPORTED_LANGUAGES)})",
+            )
+            return None
+        try:
+            backend = select_backend(message.backend, self._dependencies.backends)
+        except UnsupportedBackendError as error:
+            await self._send_error("unsupported_backend", str(error))
+            return None
+        return _UtteranceTarget(language, backend)
+
     def _emitter_for(
         self, utterance: _ReceivingUtterance, rule: BackchannelRule, pacing: BackchannelPacing
     ) -> BackchannelEmitter:
@@ -268,7 +294,9 @@ class StreamSession:
         if judging is None or rule.boundary_threshold <= 0:
             return RotationEmitter(utterance.utterance_id, rotation, delivery)
         return JudgingEmitter(
-            JudgedUtterance(utterance.utterance_id, utterance.language, utterance.samples_until),
+            JudgedUtterance(
+                utterance.utterance_id, utterance.target.language, utterance.samples_until
+            ),
             JudgingRule(rotation, rule.boundary_threshold),
             judging,
             delivery,
@@ -298,7 +326,7 @@ class StreamSession:
         self._spawn(
             self._finish(
                 _FinishedUtterance(
-                    utterance.utterance_id, utterance.language, samples, utterance.ack_request
+                    utterance.utterance_id, utterance.target, samples, utterance.ack_request
                 )
             )
         )
@@ -363,7 +391,10 @@ class StreamSession:
         started_at = time.perf_counter()
         try:
             transcription = await transcribe_samples(
-                self._dependencies.serial_transcriber, utterance.samples, utterance.language
+                self._dependencies.serial_transcriber,
+                utterance.samples,
+                utterance.target.language,
+                utterance.target.backend,
             )
         except Exception as error:
             logger.exception(
@@ -373,7 +404,7 @@ class StreamSession:
                 "transcribe_failed", f"transcribe_failed: {error}", utterance.utterance_id
             )
             return None
-        backend = self._dependencies.backend
+        backend = self._dependencies.backend_descriptions[utterance.target.backend]
         await self._sender.send(
             TranscriptEvent(
                 utterance_id=utterance.utterance_id,

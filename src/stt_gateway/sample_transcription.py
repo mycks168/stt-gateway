@@ -10,11 +10,14 @@ from .audio_decoding import AudioSamples
 from .pcm_audio import write_wav
 from .serial_transcriber import SerialTranscriber
 from .stream_audio_decoder import STREAM_SAMPLE_RATE_HZ
-from .transcription import Transcription
+from .transcription import BackendName, Transcription
 
 
 async def transcribe_samples(
-    serial_transcriber: SerialTranscriber, samples: AudioSamples, language: str
+    serial_transcriber: SerialTranscriber,
+    samples: AudioSamples,
+    language: str,
+    backend: BackendName,
 ) -> Transcription:
     """波形を WAV の一時ファイルにして文字起こしする。一時ファイルは成否にかかわらず消す。"""
     if len(samples) == 0:
@@ -23,7 +26,7 @@ async def transcribe_samples(
     # 60 秒の音声で約 2MB を書き出すため、ファイル操作もイベントループの外で行う。
     audio_path = await asyncio.to_thread(_write_temporary_wav, samples)
     try:
-        return await serial_transcriber.transcribe(audio_path, language)
+        return await serial_transcriber.transcribe(audio_path, language, backend)
     finally:
         await asyncio.to_thread(audio_path.unlink, missing_ok=True)
 

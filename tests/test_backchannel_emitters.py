@@ -107,9 +107,12 @@ def _run_emitter(setup: _Setup, scenario: EmitterScenario = _emit_fire) -> _Outc
         pacing = BackchannelPacing(_INTERVAL, 0)
         tasks: list[asyncio.Task[object]] = []
         judging = SpeechJudging(
-            SerialTranscriber(lambda: _FixedTranscriber(setup.text, setup.transcription_error)),
+            SerialTranscriber(
+                {"haas": lambda: _FixedTranscriber(setup.text, setup.transcription_error)}
+            ),
             setup.timeout_ms,
             BoundaryJudge(boundary_model),
+            "haas",
         )
         emitter = JudgingEmitter(
             JudgedUtterance(

@@ -23,6 +23,7 @@ from .boundary_judge import BoundaryJudge
 from .sample_transcription import transcribe_samples
 from .serial_transcriber import SerialTranscriber
 from .stream_messages import BackchannelEvent, EventSender, UtteranceId
+from .transcription import BackendName
 
 logger = logging.getLogger(__name__)
 
@@ -118,11 +119,14 @@ class SpeechJudging:
     """途中の文字起こしから相槌を判定するのに使う、ワーカー内で共有する部品。
 
     timeout_ms は、途中の文字起こしと区切りの判定を待つ上限。
+    backend は途中の文字起こしに使うエンジンで、発話の文字起こし結果に使うエンジンとは別に、
+    時間内に終わる速いものを使う。
     """
 
     serial_transcriber: SerialTranscriber
     timeout_ms: int
     boundary_judge: BoundaryJudge
+    backend: BackendName
 
 
 @dataclass(frozen=True)
@@ -286,7 +290,10 @@ class JudgingEmitter:
         """途中の音声を文字起こしし、区切りらしさを判定する。文字起こしに失敗したら None を返す。"""
         try:
             transcription = await transcribe_samples(
-                self._judging.serial_transcriber, samples, self._target.language
+                self._judging.serial_transcriber,
+                samples,
+                self._target.language,
+                self._judging.backend,
             )
         except Exception:
             logger.exception(

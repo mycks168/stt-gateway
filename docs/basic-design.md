@@ -24,10 +24,10 @@ uvicorn（STT_WORKERS 個のワーカープロセス）
                             ├─ stream_audio_decoder.py … Opus / PCM から波形への変換
                             └─ pcm_audio.py … 波形と WAV の変換
                           ▼（発話の終了時）
-              serial_transcriber.py（推論を 1 件ずつ実行。/transcribe と共有）
-                          │ Transcriber（Protocol）
+              serial_transcriber.py（エンジンごとにモデルを持ち、推論を 1 件ずつ実行。/transcribe と共有）
+                          │ Transcriber（Protocol）       backend_selection.py … 指定されたエンジンの決定
                           ▼
-              backends.py（設定でバックエンドを選ぶ）
+              backends.py（エンジンの情報とモデルの読み込み）
                  ├─ whisper_backend.py … faster-whisper
                  └─ haas_backend.py    … Haas-ja（haas-asr / NeMo）
                         └─ audio_decoding.py … PyAV でデコード
@@ -37,11 +37,12 @@ uvicorn（STT_WORKERS 個のワーカープロセス）
 |---|---|
 | `server.py` | HTTP API、Bearer 認証、一時ファイルの管理、例外から HTTP ステータスへの変換、起動時のモデル読み込みと `/stream` 用の部品（予測器の貸し出し・区切りの判定・一時的な返事の作成）の用意 |
 | `auth.py` | Bearer トークンの取り出しと、API キーとの比較（`/transcribe` と `/stream` で共有） |
-| `serial_transcriber.py` | ワーカー内でのモデルの保持と、推論を 1 件ずつ別スレッドで実行する順番待ち |
+| `serial_transcriber.py` | ワーカー内でのエンジンごとのモデルの保持（初めて使うときに読み込む）と、推論をエンジンをまたいで 1 件ずつ別スレッドで実行する順番待ち |
+| `backend_selection.py` | リクエストで指定されたエンジンの決定、相槌の判定に使うエンジンと起動時に読み込むエンジンの決定（純粋なロジック） |
 | `config.py` | 環境変数（`.env` を含む）の読み込みと検証 |
 | `formats.py` | 拡張子による音声フォーマットの判定 |
 | `transcription.py` | バックエンドの共通インタフェース（`Transcriber`）、結果の型（`Transcription`）、例外 |
-| `backends.py` | 設定に応じたバックエンドの読み込みと、`/health` 用の情報の算出 |
+| `backends.py` | 指定したエンジンのモデルの読み込みと、`/health` や文字起こし結果に載せる情報の算出 |
 | `whisper_backend.py` | faster-whisper による文字起こし |
 | `haas_backend.py` | Haas-ja による文字起こし |
 | `audio_decoding.py` | PyAV(ffmpeg) による音声ファイルから波形へのデコード（haas が使う） |
@@ -68,6 +69,7 @@ uvicorn（STT_WORKERS 個のワーカープロセス）
 | `pcm_audio.py` | PCM バイト列と波形の相互変換、波形から WAV への書き出し（純粋なロジック） |
 
 依存の向きは `server → serial_transcriber / backends → 各バックエンド → transcription` の一方向とする。
+`backend_selection.py` は `transcription.py` だけに依存し、`config.py`・`server.py`・`stream_session.py` から使う。
 `server.py` は faster-whisper や NeMo を直接 import しない。
 
 `/stream` の依存の向きは `server → stream_api → stream_session → backchannel_pool / backchannel_policy /
@@ -87,7 +89,8 @@ ack_generator / stream_audio_decoder / pcm_audio / serial_transcriber` とする
 |---|---|---|---|
 | `STT_HOST` | `0.0.0.0` | 共通 | バインドするアドレス（`scripts/run_server.sh` が使う） |
 | `STT_PORT` | `23000` | 共通 | ポート（同上） |
-| `STT_BACKEND` | `whisper` | 共通 | `whisper` / `haas`。それ以外の値では起動時に `ValueError` で停止する |
+| `STT_BACKEND` | `whisper` | 共通 | リクエストでエンジンを指定しないときに使うエンジン。`whisper` / `haas`。それ以外の値では起動時に `ValueError` で停止する |
+| `STT_ENABLED_BACKENDS` | (空) | 共通 | リクエストで選べるエンジン（カンマ区切り、前後の空白と重複は無視）。`STT_BACKEND` を含まない、または知らない名前があると起動時に `ValueError` で停止する。空なら `STT_BACKEND` だけ |
 | `STT_MODEL` | `large-v3-turbo` | whisper | faster-whisper のモデル名 |
 | `STT_DEVICE` | `auto` | whisper | `auto` / `cuda` / `cpu` |
 | `STT_COMPUTE_TYPE` | `int8_float16` | whisper | `int8` / `int8_float16` / `float16` / `float32` |
@@ -133,15 +136,17 @@ Triton と CUDA を必要とし、公表されている精度と速度も bfloat
 
 ### 2.2 GET /health
 
-認証不要。モデルは読み込まず、設定上の値を返す。
+認証不要。モデルは読み込まず、設定上の値を返す。`backend`・`model`・`device`・`compute_type` は
+`STT_BACKEND` のエンジンの値。
 
 | フィールド | 型 | 内容 |
 |---|---|---|
 | `ok` | bool | 常に `true` |
-| `backend` | `"whisper"` \| `"haas"` | 使用中のバックエンド |
+| `backend` | `"whisper"` \| `"haas"` | 既定のエンジン（`STT_BACKEND`） |
 | `model` | string | whisper は `STT_MODEL`、haas は `STT_HAAS_MODEL` |
 | `device` | string | whisper は `STT_DEVICE`、haas は `cuda` |
 | `compute_type` | string | whisper は `STT_COMPUTE_TYPE`、haas は `bfloat16` |
+| `enabled_backends` | array | リクエストで選べるエンジン（`STT_ENABLED_BACKENDS` の順）。要素は `backend`・`model`・`device`・`compute_type` |
 
 ### 2.3 POST /transcribe
 
@@ -151,6 +156,7 @@ Triton と CUDA を必要とし、公表されている精度と速度も bfloat
 |---|---|---|
 | `file` | ○ | 音声ファイル |
 | `language` | | 言語コード。省略時は `STT_LANGUAGE` |
+| `backend` | | 文字起こしエンジン（`whisper` / `haas`）。省略時は `STT_BACKEND`。`STT_ENABLED_BACKENDS` にあるものだけ選べる |
 
 対応フォーマットは拡張子で判定する（`formats.py` の `ALLOWED_SUFFIXES`）。ファイル名や拡張子が
 無い場合は `.wav` として扱う。
@@ -169,8 +175,8 @@ Triton と CUDA を必要とし、公表されている精度と速度も bfloat
 | `text` | string | 文字起こし結果（前後の空白は除く） |
 | `language` | string | whisper は Whisper が判定した言語、haas は指定された言語（`ja`） |
 | `duration` | number \| null | 音声の長さ（秒） |
-| `latency_ms` | int | 文字起こしにかかった時間（ミリ秒）。同じワーカーでの順番待ちの時間を含む |
-| `backend` | `"whisper"` \| `"haas"` | 使用したバックエンド |
+| `latency_ms` | int | 文字起こしにかかった時間（ミリ秒）。同じワーカーでの順番待ちの時間と、初めて使うエンジンのモデルの読み込みを含む |
+| `backend` | `"whisper"` \| `"haas"` | 使用したエンジン |
 | `model` | string | 使用したモデル |
 
 エラー：
@@ -178,13 +184,14 @@ Triton と CUDA を必要とし、公表されている精度と速度も bfloat
 | ステータス | 条件 | `detail` |
 |---|---|---|
 | `400` | 対応外の拡張子 | `unsupported audio format: '.mp4' (allowed: .ogg, .opus, .wav, .webm)` |
+| `400` | 知らないエンジン、または `STT_ENABLED_BACKENDS` に無いエンジン | `unsupported backend: 'haas' (enabled: whisper)` |
 | `400` | バックエンドが対応しない言語（haas で `ja` 以外） | `unsupported language for backend 'haas': 'en' (supported: ja)` |
 | `401` | ヘッダが無い | `Not authenticated` |
 | `401` | トークンが一致しない | `invalid_token` |
 | `500` | モデルの読み込みまたは文字起こしに失敗 | `transcribe_failed: <理由>` |
 
 haas で extras が入っていない場合、理由は
-`` STT_BACKEND=haas requires the 'haas' extra: run `uv sync --extra haas` `` になる。
+`` backend 'haas' requires the 'haas' extra: run `uv sync --extra haas` `` になる。
 
 ### 2.4 WebSocket /stream
 
@@ -210,7 +217,7 @@ haas で extras が入っていない場合、理由は
 
 | 種類 | 形式 | 内容 |
 |---|---|---|
-| 発話の開始 | テキスト（JSON） | `{"type": "start", "encoding": "opus", "language": "ja", "ack": {...}, "backchannel": {...}}`。`type` 以外は省略可（省略時は `opus`・`STT_LANGUAGE`・サーバの設定）。`ack` と `backchannel` は下の「発話ごとの指定」 |
+| 発話の開始 | テキスト（JSON） | `{"type": "start", "encoding": "opus", "language": "ja", "backend": "haas", "ack": {...}, "backchannel": {...}}`。`type` 以外は省略可（省略時は `opus`・`STT_LANGUAGE`・`STT_BACKEND`・サーバの設定）。`backend` は `transcript` に使うエンジンで、`STT_ENABLED_BACKENDS` にあるものだけ選べる。`ack` と `backchannel` は下の「発話ごとの指定」 |
 | 音声 | バイナリ | `encoding` に従う（下表） |
 | 発話の終了 | テキスト（JSON） | `{"type": "end"}` |
 
@@ -228,6 +235,8 @@ haas で extras が入っていない場合、理由は
 - 音声は `start` から `end` までの間だけ受け付ける。
 - `end` を送った後、その発話の結果を待たずに次の `start` を送ってよい。
 - 言語は `ja` のみ対応する。相槌の文言と区切りの判定を、日本語の話し言葉で調整しているため。
+- `backend` は `transcript` の文字起こしだけに効く。相槌の判定に使う途中の文字起こしは、`backend` に
+  かかわらず下の「相槌の決め方」のエンジンで行う。判定は短い時間で終える必要があるため。
 
 #### 発話ごとの指定（`start` の `ack` と `backchannel`）
 
@@ -285,7 +294,7 @@ haas で extras が入っていない場合、理由は
 |---|---|---|
 | `started` | `start` を受け付けたとき | `utterance_id`、`backchannel`（この発話で相槌を出すか。bool）、`backchannel_unavailable_reason`（`backchannel` が `false` のとき `"busy"` \| `"unavailable"`、それ以外は `null`） |
 | `backchannel` | 発話中、相槌を出すと決めたとき | `utterance_id`、`text`（相槌の文言）、`offset_ms`（発話の先頭からの音声上の位置。int）、`probability`（相槌を出したフレームの話していない確率） |
-| `transcript` | `end` の後、文字起こしが終わったとき | `utterance_id`、`text`、`language`、`duration`、`latency_ms`、`backend`、`model`（各フィールドの意味は `/transcribe` の応答と同じ） |
+| `transcript` | `end` の後、文字起こしが終わったとき | `utterance_id`、`text`、`language`、`duration`、`latency_ms`、`backend`、`model`（各フィールドの意味は `/transcribe` の応答と同じ。`backend` はこの発話の `start` で選んだエンジン） |
 | `ack` | `transcript` の後、一時的な返事ができたとき | `utterance_id`、`text`、`source`（`"llm"` \| `"fallback"`）、`latency_ms`（`transcript` を送ってから `ack` を送るまで） |
 | `error` | 下表のとき | `utterance_id`、`code`、`detail` |
 
@@ -306,6 +315,7 @@ haas で extras が入っていない場合、理由は
 | `invalid_audio` | Opus のパケットをデコードできない、`pcm_s16le` で奇数バイト | 継続（そのメッセージの音声は捨てる） |
 | `invalid_state` | 発話中に `start`、発話中でないときに音声または `end` | 継続 |
 | `unsupported_language` | `ja` 以外の言語 | 継続（その発話は始まらない） |
+| `unsupported_backend` | 知らないエンジン、または `STT_ENABLED_BACKENDS` に無いエンジン（`detail` は `/transcribe` の `400` と同じ） | 継続（その発話は始まらない） |
 | `utterance_too_long` | 1 発話の音声が `STT_STREAM_MAX_UTTERANCE_SECONDS` を超えた | 継続（その発話は破棄し、`end` まで音声を捨てる） |
 | `transcribe_failed` | 文字起こしに失敗（`detail` は `/transcribe` の `500` と同じ） | 継続（その発話の `ack` は送らない） |
 
@@ -359,6 +369,10 @@ Silero VAD が 32ms ごとに「話していない確率」を出し、0.5 以�
   - 直近 15 秒にするのは、発話の頭から文字起こしすると、長い話ほど判定が遅れて
     `STT_BACKCHANNEL_JUDGE_TIMEOUT_MS` に間に合わなくなるため（50 秒を過ぎると 150〜175ms かかった）。
     区切りの判定が見るのは文字起こしの末尾で、前の文脈は数文あれば足りる。
+  - 途中の文字起こしには、`STT_ENABLED_BACKENDS` に haas があれば haas を使い、無ければ
+    `STT_BACKEND` を使う。発話の `start` の `backend` は関係しない。直近 15 秒の音声で haas は
+    約 40ms、whisper は約 320ms かかり（RTX 5060 Ti、録音した話し言葉で測定）、whisper では
+    `STT_BACKCHANNEL_JUDGE_TIMEOUT_MS`（既定 200ms）に間に合わず相槌が出なくなるため。
   - 区切りらしさは、文字起こし（末尾の記号と空白を除く）の続きに、言語モデルが区切りのトークン
     （空白・改行だけ、または記号で始まるもの）を予測する確率の合計。言いかけ（「なので」
     「〜の方で」）の後には言葉が続きやすく、言い終わり（「〜なんだよね」）の後には句読点が
@@ -437,21 +451,31 @@ Ollama の `/api/chat` に、システムプロンプトと会話例を付けて
 
 ## 3. 処理の流れ
 
-1. ワーカーの起動時（lifespan）に、設定されたバックエンドのモデルを読み込む。
-   読み込みに失敗してもワーカーは起動を続け、失敗をログに出す。その後の `/transcribe` で
+1. ワーカーの起動時（lifespan）に、`STT_BACKEND` のエンジンのモデルを読み込む。区切りの判定を
+   使う（`STT_BACKCHANNEL_BOUNDARY_MODEL` を読み込めた）ときは、途中の文字起こしに使うエンジンの
+   モデルも読み込む。最初の判定がモデルの読み込みを待つと、時間切れで相槌が出ないため。
+   ほかのエンジンは、初めて指定されたときに読み込み、その後はワーカーが終わるまで保持する。
+   使わないエンジンで GPU メモリを使わないため。
+   読み込みに失敗してもワーカーは起動を続け、失敗をログに出す。その後の文字起こしで
    読み込みを再試行し、失敗すれば `500` で理由を返す（extras 未導入などを利用者が知れるように）。
-2. 拡張子を判定し、アップロードされた内容を同じ拡張子の一時ファイルに書き出す。
-3. 同じワーカーで処理中の文字起こしがあれば、終わるまで待つ。
-4. バックエンドで文字起こしする。一時ファイルは成否にかかわらず削除する。
+2. 拡張子とエンジンを判定し、アップロードされた内容を同じ拡張子の一時ファイルに書き出す。
+3. 指定されたエンジンのモデルが未読み込みなら読み込む。
+4. 同じワーカーで処理中の文字起こしがあれば、エンジンにかかわらず終わるまで待つ。
+5. 指定されたエンジンで文字起こしする。一時ファイルは成否にかかわらず削除する。
 
 ### 3.0 並列処理
 
-- 並列化はワーカープロセスを増やして行う（`STT_WORKERS`）。各ワーカーがモデルを 1 つずつ持つ。
+- 並列化はワーカープロセスを増やして行う（`STT_WORKERS`）。各ワーカーが、使ったエンジンのモデルを 1 つずつ持つ。
   プロセス間で共有する状態が無いため、どちらのバックエンドでも同じ方法で並列にできる。
   GPU メモリはワーカー数に比例して必要になる。
 - ワーカー内では推論を 1 件ずつ実行する（`SerialTranscriber`）。haas（NeMo）は `transcribe()` の
   たびに前処理の dither・`pad_to` やモジュールの freeze 状態を書き換えて元に戻し、デコーダの
   CUDA Graph も固定バッファを共有するため、同じモデルを複数スレッドから同時に呼べない。
+  エンジンが違う推論も重ねない。GPU を取り合うと、相槌の判定が `STT_BACKCHANNEL_JUDGE_TIMEOUT_MS`
+  に間に合わなくなるため。
+- モデルの読み込みはエンジンごとのロックで行い、推論の順番待ちには入れない。whisper の読み込みに
+  数秒かかる間も、haas の推論（相槌の判定を含む）を止めないため。同じエンジンへ同時に来た
+  リクエストは、1 回の読み込みを待つ。
 - 推論とモデルの読み込みは別スレッドで実行し、イベントループを止めない。推論中も `/health` や
   ほかのリクエストのアップロード受信は処理される。順番待ちはイベントループ上のロック
   （`asyncio.Lock`）で行い、待っているリクエストがスレッドプールを占有しないようにする。
@@ -599,8 +623,11 @@ uv run pytest --cov=stt_gateway
 ```
 
 モデルはダミーに差し替え、GPU とモデル本体なしで実行する。`SerialTranscriber` は、
-同時に投げた推論が重ならないこと、推論中もイベントループが進むこと、読み込みの失敗を
-次のリクエストで再試行することを検証する。haas バックエンドは
+同時に投げた推論がエンジンをまたいでも重ならないこと、推論中もイベントループが進むこと、
+読み込みの失敗を次のリクエストで再試行すること、あるエンジンの読み込み中もほかのエンジンで
+文字起こしできることを検証する。エンジンの選択は、省略時の既定・有効でないエンジンの `400`・
+起動時は既定のエンジン（と判定に使うエンジン）だけを読み込み、ほかは初めて指定されたときに
+1 回だけ読み込むこと・`/health` の `enabled_backends` を検証する。haas バックエンドは
 `haas_asr` モジュールをダミーに差し替えて、読み込み・長尺処理の呼び出し・extras 未導入時の
 エラーを検証する。カバレッジが 80% を下回るとテストが失敗する。
 
@@ -610,6 +637,7 @@ uv run pytest --cov=stt_gateway
 - 認証の失敗
 - 予測器の上限に達したとき・extras が無いときに、相槌なしで `transcript` と `ack` が届くこと
 - メッセージの順序の誤り（発話中の `start` など）と、各 `error` の `code`
+- `start` の `backend` で `transcript` のエンジンが変わり、途中の文字起こしは haas で行うこと
 - 1 発話で `started` → `backchannel` → `transcript` → `ack` の順にイベントが届くこと
 - 相槌の決め方（クライアントが指定した無音の長さ、最短の間隔、文言の順番、`end` 後の予測を送らないこと）
 - 最短の間隔が経過時間と相槌の回数で伸び、上限で止まること（上限が最短の間隔より小さいときは最短の間隔）
@@ -630,5 +658,8 @@ uv run pytest --cov=stt_gateway
 - 一時的な返事のモデルの読み込み（読み込みだけの要求、同時に 1 本まで、返事が時間切れでも続くこと、
   失敗の記録、終了時の取り消し）と、`start` で読み込みを始めること（`ack: false` では始めない）
 - Opus パケットと PCM のデコード（実際に PyAV でエンコードした Opus を使う）と、壊れたパケットの扱い
+
+起動スクリプト（`scripts/run_server.sh`）は、偽の `uv` を置いて実行し、`STT_ENABLED_BACKENDS` が
+未定義でも起動できること、haas を使うときだけ `--extra haas` を付けることを検証する。
 
 区切りの判定の言語モデルと Ollama を実際に使う確認は、自動テストとは別に手動で行う。

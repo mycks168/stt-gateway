@@ -30,7 +30,7 @@ if [ "$WORKERS" -lt 1 ]; then
   exit 1
 fi
 
-# 各ワーカーはモデルを 1 つずつ読み込む。ワーカーを増やすと GPU メモリもその数だけ必要になる。
+# 各ワーカーが使うエンジンのモデルをそれぞれ読み込む。ワーカーを増やすと GPU メモリもその数だけ必要になる。
 UVICORN_ARGS=(stt_gateway.server:app --host "$HOST" --port "$PORT" --workers "$WORKERS"
   --log-config scripts/logging.json)
 # 指定件数を処理したワーカーを終了させ、肥大化したメモリを解放する。
@@ -52,9 +52,11 @@ setup_cublas_path() {
   fi
 }
 
-# Haas-ja の依存（NeMo, torch）は extras に分けている。uv 管理の環境では起動時に入れる。
+# Haas-ja の依存（NeMo, torch）は extras に分けている。uv 管理の環境では、haas を使うなら起動時に入れる。
 UV_RUN=(uv run)
-if [ "${STT_BACKEND:-whisper}" = "haas" ]; then
+ENABLED_BACKENDS="${STT_ENABLED_BACKENDS:-}"
+ENABLED_BACKENDS=",${ENABLED_BACKENDS// /},"
+if [ "${STT_BACKEND:-whisper}" = "haas" ] || [[ "$ENABLED_BACKENDS" == *",haas,"* ]]; then
   UV_RUN=(uv run --extra haas)
 fi
 

@@ -13,6 +13,7 @@ from stt_gateway.ack_generator import AckGenerator
 from stt_gateway.audio_decoding import AudioSamples
 from stt_gateway.backchannel_policy import BackchannelFrame, BackchannelPredictor
 from stt_gateway.backchannel_pool import BackchannelPool
+from stt_gateway.backend_selection import BackendSelection
 from stt_gateway.backends import BackendDescription
 from stt_gateway.config import AckSettings, BackchannelSettings
 from stt_gateway.pcm_audio import samples_to_pcm_s16le
@@ -97,10 +98,13 @@ def _session(
 ) -> StreamSession:
     """ダミーの部品で StreamSession を作る。"""
     dependencies = StreamDependencies(
-        serial_transcriber=SerialTranscriber(_FixedTranscriber),
+        serial_transcriber=SerialTranscriber({"whisper": _FixedTranscriber}),
         backchannel_pool=pool,
         ack_generator=AckGenerator(_ACK_SETTINGS, client),
-        backend=BackendDescription("whisper", "large-v3-turbo", "auto", "int8_float16"),
+        backends=BackendSelection("whisper", ("whisper",)),
+        backend_descriptions={
+            "whisper": BackendDescription("whisper", "large-v3-turbo", "auto", "int8_float16")
+        },
         default_language="ja",
         max_utterance_seconds=60,
         backchannel=_BACKCHANNEL_SETTINGS,

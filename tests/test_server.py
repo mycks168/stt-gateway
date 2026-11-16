@@ -5,12 +5,19 @@ from collections.abc import Iterator
 from http import HTTPStatus
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from stt_gateway import server
+from stt_gateway.backend_selection import BackendSelection
 from stt_gateway.config import Settings
-from stt_gateway.transcription import Transcriber, Transcription, UnsupportedLanguageError
+from stt_gateway.transcription import (
+    BackendName,
+    Transcriber,
+    Transcription,
+    UnsupportedLanguageError,
+)
 
 _FAKE_DURATION_SECONDS = 1.23
 
@@ -33,13 +40,17 @@ class _FakeTranscriber:
 def default_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     """ローカルの.envの値に依存せず、whisper バックエンド・認証無効の状態でテストする。"""
     monkeypatch.setattr(
-        server, "settings", dataclasses.replace(server.settings, backend="whisper", api_key="")
+        server,
+        "settings",
+        dataclasses.replace(
+            server.settings, backends=BackendSelection("whisper", ("whisper",)), api_key=""
+        ),
     )
 
 
 def _use_backend(monkeypatch: pytest.MonkeyPatch, transcriber: Transcriber) -> None:
     """設定に関係なく、指定したダミーをバックエンドとして読み込ませる。"""
-    monkeypatch.setattr(server, "load_transcriber", lambda _settings: transcriber)
+    monkeypatch.setattr(server, "load_transcriber", lambda _settings, _backend: transcriber)
 
 
 @pytest.fixture(autouse=True)
@@ -72,7 +83,11 @@ def test_health(client: TestClient) -> None:
 
 
 def test_health_reports_haas_backend(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(server, "settings", dataclasses.replace(server.settings, backend="haas"))
+    monkeypatch.setattr(
+        server,
+        "settings",
+        dataclasses.replace(server.settings, backends=BackendSelection("haas", ("haas",))),
+    )
     body = client.get("/health").json()
     assert body["backend"] == "haas"
     assert body["model"] == server.settings.haas_model
@@ -212,11 +227,11 @@ def test_transcribe_returns_400_for_unsupported_language(monkeypatch: pytest.Mon
 
 
 def test_model_is_loaded_at_startup(monkeypatch: pytest.MonkeyPatch) -> None:
-    loaded: list[Settings] = []
+    loaded: list[BackendName] = []
 
-    def _count_loads(settings: Settings) -> _FakeTranscriber:
+    def _count_loads(_settings: Settings, backend: BackendName) -> _FakeTranscriber:
         """読み込み回数を数える。"""
-        loaded.append(settings)
+        loaded.append(backend)
         return _FakeTranscriber()
 
     monkeypatch.setattr(server, "load_transcriber", _count_loads)
@@ -233,7 +248,7 @@ def test_model_is_loaded_at_startup(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_transcribe_returns_500_when_backend_cannot_load(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    def _fail_to_load(_settings: Settings) -> Transcriber:
+    def _fail_to_load(_settings: Settings, _backend: BackendName) -> Transcriber:
         """extras 未導入でモデルを読み込めない状況を再現する。"""
         raise RuntimeError("requires the 'haas' extra")
 
@@ -257,3 +272,75 @@ def test_transcribe_fails_without_lifespan(monkeypatch: pytest.MonkeyPatch) -> N
         headers=_AUTH_HEADERS,
     )
     assert res.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
+
+
+def _enable_both_backends(monkeypatch: pytest.MonkeyPatch) -> list[BackendName]:
+    """既定を haas にして whisper も選べるようにし、読み込んだエンジンの記録を返す。
+
+    lifespan の前に呼ぶ。
+    """
+    loaded: list[BackendName] = []
+
+    def _record_loads(_settings: Settings, backend: BackendName) -> _FakeTranscriber:
+        """読み込んだエンジンを記録する。"""
+        loaded.append(backend)
+        return _FakeTranscriber()
+
+    monkeypatch.setattr(
+        server,
+        "settings",
+        dataclasses.replace(
+            server.settings, backends=BackendSelection("haas", ("haas", "whisper"))
+        ),
+    )
+    monkeypatch.setattr(server, "load_transcriber", _record_loads)
+    return loaded
+
+
+def _post_sample(client: TestClient, **form: str) -> httpx.Response:
+    """WAV を 1 つ送って文字起こしさせる。"""
+    return client.post(
+        "/transcribe",
+        files={"file": ("sample.wav", b"RIFF....", "audio/wav")},
+        data=form,
+        headers=_AUTH_HEADERS,
+    )
+
+
+def test_requested_backend_is_loaded_on_first_use(monkeypatch: pytest.MonkeyPatch) -> None:
+    loaded = _enable_both_backends(monkeypatch)
+    with TestClient(server.app) as client:
+        assert loaded == ["haas"], "起動時は既定のエンジンだけを読み込むこと"
+        first = _post_sample(client, backend="whisper")
+        second = _post_sample(client, backend="whisper")
+        default = _post_sample(client)
+    assert loaded == ["haas", "whisper"], "指定されたエンジンは 1 回だけ読み込むこと"
+    assert first.json()["backend"] == "whisper"
+    assert first.json()["model"] == server.settings.model
+    assert second.status_code == HTTPStatus.OK
+    assert default.json()["backend"] == "haas"
+    assert default.json()["model"] == server.settings.haas_model
+
+
+@pytest.mark.parametrize("requested", ["haas", "Whisper", "kotoba"])
+def test_transcribe_rejects_backend_that_is_not_enabled(
+    client: TestClient, fake_model: _FakeTranscriber, requested: str
+) -> None:
+    res = _post_sample(client, backend=requested)
+    assert res.status_code == HTTPStatus.BAD_REQUEST
+    assert res.json()["detail"] == f"unsupported backend: '{requested}' (enabled: whisper)"
+    assert not fake_model.calls
+
+
+def test_health_lists_enabled_backends(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable_both_backends(monkeypatch)
+    with TestClient(server.app) as client:
+        body = client.get("/health").json()
+    assert body["backend"] == "haas"
+    assert [info["backend"] for info in body["enabled_backends"]] == ["haas", "whisper"]
+    assert body["enabled_backends"][1] == {
+        "backend": "whisper",
+        "model": server.settings.model,
+        "device": server.settings.device,
+        "compute_type": server.settings.compute_type,
+    }

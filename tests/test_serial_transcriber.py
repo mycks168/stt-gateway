@@ -41,9 +41,10 @@ def test_transcriptions_run_one_at_a_time() -> None:
 
     async def _send_concurrently() -> list[Transcription]:
         """同時に複数件の文字起こしを投げる。"""
-        serial = SerialTranscriber(lambda: backend)
+        serial = SerialTranscriber({"whisper": lambda: backend})
         requests = (
-            serial.transcribe(Path(f"{index}.wav"), "ja") for index in range(_CONCURRENT_REQUESTS)
+            serial.transcribe(Path(f"{index}.wav"), "ja", "whisper")
+            for index in range(_CONCURRENT_REQUESTS)
         )
         return await asyncio.gather(*requests)
 
@@ -57,9 +58,9 @@ def test_event_loop_keeps_running_during_inference() -> None:
 
     async def _tick_during_inference() -> int:
         """推論中にイベントループ上の別の処理が進んだ回数を返す。"""
-        serial = SerialTranscriber(lambda: backend)
+        serial = SerialTranscriber({"whisper": lambda: backend})
         ticks = 0
-        task = asyncio.create_task(serial.transcribe(Path("a.wav"), "ja"))
+        task = asyncio.create_task(serial.transcribe(Path("a.wav"), "ja", "whisper"))
         while not task.done():
             ticks += 1
             await asyncio.sleep(0)
@@ -79,10 +80,11 @@ def test_model_is_loaded_once_across_preload_and_requests() -> None:
 
     async def _preload_then_transcribe() -> None:
         """起動時の読み込みの後に、同時に文字起こしする。"""
-        serial = SerialTranscriber(_load)
-        await serial.preload()
+        serial = SerialTranscriber({"whisper": _load})
+        await serial.preload("whisper")
         await asyncio.gather(
-            serial.transcribe(Path("a.wav"), "ja"), serial.transcribe(Path("b.wav"), "ja")
+            serial.transcribe(Path("a.wav"), "ja", "whisper"),
+            serial.transcribe(Path("b.wav"), "ja", "whisper"),
         )
 
     asyncio.run(_preload_then_transcribe())
@@ -101,10 +103,70 @@ def test_failed_load_is_retried_on_next_request() -> None:
 
     async def _preload_then_transcribe() -> Transcription:
         """起動時の読み込み失敗の後に文字起こしする。"""
-        serial = SerialTranscriber(_fail_first_time)
+        serial = SerialTranscriber({"whisper": _fail_first_time})
         with pytest.raises(RuntimeError, match="download failed"):
-            await serial.preload()
-        return await serial.transcribe(Path("a.wav"), "ja")
+            await serial.preload("whisper")
+        return await serial.transcribe(Path("a.wav"), "ja", "whisper")
 
     assert asyncio.run(_preload_then_transcribe()).text == "a.wav"
     assert len(attempts) == _LOAD_ATTEMPTS_AFTER_ONE_FAILURE
+
+
+def test_transcriptions_do_not_overlap_across_backends() -> None:
+    whisper = _OverlapDetectingTranscriber()
+    haas = _OverlapDetectingTranscriber()
+    shared_counter = _OverlapDetectingTranscriber()
+
+    class _Counting:
+        """エンジンごとのダミーに渡しつつ、エンジンをまたいだ同時実行数も数える。"""
+
+        def __init__(self, inner: _OverlapDetectingTranscriber) -> None:
+            self._inner = inner
+
+        def transcribe(self, audio_path: Path, language: str) -> Transcription:
+            """全体の同時実行数を数えながら、エンジンのダミーで文字起こしする。"""
+            shared_counter.transcribe(audio_path, language)
+            return self._inner.transcribe(audio_path, language)
+
+    async def _send_to_both() -> None:
+        """2 つのエンジンへ同時に文字起こしを投げる。"""
+        serial = SerialTranscriber(
+            {"whisper": lambda: _Counting(whisper), "haas": lambda: _Counting(haas)}
+        )
+        await asyncio.gather(
+            serial.transcribe(Path("a.wav"), "ja", "whisper"),
+            serial.transcribe(Path("b.wav"), "ja", "haas"),
+        )
+
+    asyncio.run(_send_to_both())
+    assert shared_counter.max_running == 1
+
+
+def test_loading_one_backend_does_not_block_another() -> None:
+    is_loading = threading.Event()
+    release_loading = threading.Event()
+
+    def _slow_load() -> _OverlapDetectingTranscriber:
+        """解放されるまで読み込みを終えない。"""
+        is_loading.set()
+        release_loading.wait(timeout=5)
+        return _OverlapDetectingTranscriber()
+
+    async def _transcribe_while_loading() -> Transcription:
+        """whisper の読み込み中に haas で文字起こしする。"""
+        serial = SerialTranscriber({"haas": _OverlapDetectingTranscriber, "whisper": _slow_load})
+        loading = asyncio.create_task(serial.transcribe(Path("w.wav"), "ja", "whisper"))
+        while not is_loading.is_set():
+            await asyncio.sleep(0.01)
+        result = await asyncio.wait_for(serial.transcribe(Path("h.wav"), "ja", "haas"), 2)
+        release_loading.set()
+        await loading
+        return result
+
+    assert asyncio.run(_transcribe_while_loading()).text == "h.wav"
+
+
+def test_backend_without_loader_is_rejected() -> None:
+    serial = SerialTranscriber({"whisper": _OverlapDetectingTranscriber})
+    with pytest.raises(ValueError, match="backend 'haas' is not enabled in this worker"):
+        asyncio.run(serial.transcribe(Path("a.wav"), "ja", "haas"))
